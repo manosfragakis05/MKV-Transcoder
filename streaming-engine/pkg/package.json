@@ -1,0 +1,15 @@
+{
+  "name": "streaming-engine",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "streaming_engine_bg.wasm",
+    "streaming_engine.js",
+    "streaming_engine.d.ts"
+  ],
+  "main": "streaming_engine.js",
+  "types": "streaming_engine.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

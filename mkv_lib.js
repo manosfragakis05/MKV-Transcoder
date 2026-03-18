@@ -1,126 +1,52 @@
-import Module from './streaming-engine/target/wasm32-unknown-emscripten/release/streaming-engine.js';
+import initModule from './streaming-engine/target/wasm32-unknown-emscripten/release/streaming-engine.js';
+let wasm = null;
 
-let wasmModule = null;
-
-async function init() {
-    if (!wasmModule) {
-        // In Modularized ES6, we await the factory to get the actual instance
-        wasmModule = await Module();
-        console.log("🛠️ WASM Instance initialized. Keys:", Object.keys(wasmModule));
-    }
-    return wasmModule;
-}
-
-// BULLETPROOF MEMORY VIEWER
-// This guarantees we always have the right memory array, even if it grows or changes names!
-function getWasmView() {
-    const buffer = wasmModule.HEAPU8 ? wasmModule.HEAPU8.buffer :
-        (wasmModule.wasmMemory ? wasmModule.wasmMemory.buffer :
-            (wasmModule.memory ? wasmModule.memory.buffer : null));
-
-    if (!buffer) {
-        console.error("WASM Module State:", wasmModule);
-        throw new Error("Could not find WASM memory buffer! Check console for Module state.");
-    }
-    return new Uint8Array(buffer);
-}
-
-// 3. We recreate your 'Demuxer' class to wrap the raw C-functions
-class Demuxer {
-    constructor(videoId, audioId, width, height, duration, codecId, needsFfmpeg = false) {
-        // 1. Convert the string to raw bytes and add a null-terminator (\0) for C/Rust
-        const encoder = new TextEncoder();
-        const codecBytes = encoder.encode(codecId + "\0");
-
-        // 2. Use OUR custom Rust memory allocator!
-        const codecPtr = wasmModule._alloc_memory(codecBytes.length);
-        getWasmView().set(codecBytes, codecPtr);
-
-        // 3. Safe 5-Argument Call
-        this.ptr = wasmModule._demuxer_new(videoId, audioId, width, height, codecPtr);
-
-        // 4. Safe Dedicated Toggle Call
-        wasmModule._demuxer_set_ffmpeg(this.ptr, needsFfmpeg ? 1 : 0);
-
-        // 5. Use OUR custom Rust free function! No more memory crossing!
-        wasmModule._free_memory(codecPtr, codecBytes.length);
-    }
-
-    init(headerData) {
-        let headerPtr = wasmModule._alloc_memory(headerData.length);
-        getWasmView().set(headerData, headerPtr);
-        wasmModule._demuxer_init(this.ptr, headerPtr, headerData.length);
-        let outPtr = wasmModule._demuxer_get_output_ptr(this.ptr);
-        let outLen = wasmModule._demuxer_get_output_len(this.ptr);
-        let result = new Uint8Array(getWasmView().buffer, outPtr, outLen).slice();
-        wasmModule._free_memory(headerPtr, headerData.length);
-        return result;
-    }
-
-    parse_chunk(chunkData, isFinal) {
-        let chunkPtr = wasmModule._alloc_memory(chunkData.length);
-        getWasmView().set(chunkData, chunkPtr);
-        let framesStaged = wasmModule._demuxer_parse_chunk(this.ptr, chunkPtr, chunkData.length, isFinal);
-        wasmModule._free_memory(chunkPtr, chunkData.length);
-        return framesStaged;
-    }
-
-    get_mp4_segment() {
-        wasmModule._demuxer_get_mp4_segment(this.ptr);
-        let outPtr = wasmModule._demuxer_get_output_ptr(this.ptr);
-        let outLen = wasmModule._demuxer_get_output_len(this.ptr);
-        return new Uint8Array(getWasmView().buffer, outPtr, outLen).slice();
-    }
-
-    // NEW: Extract the raw sound waves!
-    get_pcm_data() {
-        let pcmLen = wasmModule._demuxer_get_pcm_len(this.ptr);
-        if (pcmLen === 0) return null;
-        let pcmPtr = wasmModule._demuxer_get_pcm_ptr(this.ptr);
-        let pcmData = new Float32Array(getWasmView().buffer, pcmPtr, pcmLen).slice();
-        wasmModule._demuxer_clear_pcm(this.ptr);
-        return pcmData;
-    }
-
-    reset() { wasmModule._demuxer_reset(this.ptr); }
+// Memory unlocker
+function getWasmMemory() {
+    if (wasm.HEAPU8 && wasm.HEAPU8.buffer) return wasm.HEAPU8.buffer;
+    if (wasm.asm && wasm.asm.memory && wasm.asm.memory.buffer) return wasm.asm.memory.buffer;
+    if (wasm.memory && wasm.memory.buffer) return wasm.memory.buffer;
+    if (wasm.wasmMemory && wasm.wasmMemory.buffer) return wasm.wasmMemory.buffer;
+    console.error("🔍 WASM Object Dump:", wasm);
+    throw new Error("CRITICAL: Emscripten memory buffer not found! Check the console dump.");
 }
 
 class MKVFetcher {
-    constructor(type, source) {
-        this.type = type;
+    constructor(source) {
         this.source = source;
-        this.size = Infinity; // Default to Infinity to prevent 416 negative ranges!
+        this.type = source instanceof File ? 'file' : 'url';
+        this.size = Infinity;
     }
 
     async init() {
-        if (this.type === 'file') {
+        if (this.source instanceof File) {
+            this.type = 'file';
             this.size = this.source.size;
             return;
         }
 
         try {
-            // 1. Try the standard HEAD request first
-            const res = await fetch(this.source, { method: 'HEAD' });
+            const res = await fetch(this.source, {
+                method: 'HEAD',
+                signal: AbortSignal.timeout(3000)
+            });
             const length = parseInt(res.headers.get('content-length'));
             if (length && !isNaN(length)) {
                 this.size = length;
                 return;
             }
         } catch (e) {
-            console.warn("HEAD request failed, trying fallback...");
+            console.warn("HEAD request ignored or timed out. Dropping to GET fallback...");
         }
 
         try {
-            // 2. Fallback: 1-byte GET request
             const controller = new AbortController();
             const res = await fetch(this.source, {
                 headers: { 'Range': 'bytes=0-0' },
                 signal: controller.signal
             });
             const cr = res.headers.get('content-range');
-            if (cr) {
-                this.size = parseInt(cr.split('/')[1]);
-            }
+            if (cr) this.size = parseInt(cr.split('/')[1]);
             controller.abort();
         } catch (e) {
             console.warn("Could not fetch file size. Engine will run in blind mode.");
@@ -138,7 +64,6 @@ class MKVFetcher {
                 headers: { 'Range': `bytes=${start}-${end - 1}` },
                 signal: signal
             });
-
             if (!res.ok) {
                 if (res.status === 416) return new Uint8Array(0);
                 throw new Error(`HTTP Error ${res.status} for range ${start}-${end - 1}`);
@@ -159,7 +84,6 @@ class MKVFetcher {
                 headers: { 'Range': `bytes=${start}-${end - 1}` },
                 signal: signal
             });
-
             if (!res.ok) {
                 if (res.status === 416) return;
                 throw new Error(`HTTP Error ${res.status} for range ${start}-${end - 1}`);
@@ -202,20 +126,77 @@ function readVintJS(buffer, offset, maxOffset) {
     for (let i = 1; i < length; i++) {
         value = (value * 256) + buffer[offset + i];
     }
-
     return { value: value, length: length };
+}
+
+class Demuxer {
+    constructor(videoId, audioId, width, height, duration, codecId) {
+        const encoder = new TextEncoder();
+        const codecBytes = encoder.encode(codecId + "\0");
+        const codecPtr = wasm._alloc_memory(codecBytes.length);
+        new Uint8Array(getWasmMemory(), codecPtr, codecBytes.length).set(codecBytes);
+
+        this.ptr = wasm._demuxer_create(
+            BigInt(videoId), BigInt(audioId),
+            Number(width), Number(height),
+            Number(duration), codecPtr
+        );
+
+        wasm._free_memory(codecPtr, codecBytes.length);
+    }
+
+    setTranscodeMode(needsTranscode) {
+        wasm._demuxer_set_transcode_mode(this.ptr, needsTranscode);
+    }
+
+    _handleBufferResult(ptr) {
+        if (ptr === 0) return new Uint8Array(0);
+        const len = wasm._demuxer_get_last_len(this.ptr);
+        if (len === 0) return new Uint8Array(0);
+
+        const data = new Uint8Array(getWasmMemory(), ptr, len).slice();
+        wasm._free_segment(ptr, len);
+        return data;
+    }
+
+    init(chunkData) {
+        const chunkPtr = wasm._alloc_memory(chunkData.length);
+        new Uint8Array(getWasmMemory(), chunkPtr, chunkData.length).set(chunkData);
+        const ptr = wasm._demuxer_init(this.ptr, chunkPtr, chunkData.length);
+        wasm._free_memory(chunkPtr, chunkData.length);
+        return this._handleBufferResult(ptr);
+    }
+
+    get_mp4_segment() {
+        const ptr = wasm._demuxer_get_mp4_segment(this.ptr);
+        return this._handleBufferResult(ptr);
+    }
+
+    parse_chunk(chunkData, isFinal) {
+        const chunkPtr = wasm._alloc_memory(chunkData.length);
+        new Uint8Array(getWasmMemory(), chunkPtr, chunkData.length).set(chunkData);
+        const frames = wasm._demuxer_parse_chunk(this.ptr, chunkPtr, chunkData.length, isFinal);
+        wasm._free_memory(chunkPtr, chunkData.length);
+        return frames;
+    }
+
+    reset() { wasm._demuxer_reset(this.ptr); }
+    destroy() { wasm._demuxer_destroy(this.ptr); }
 }
 
 class CoreEngine {
     constructor() {
         this.video = null;
         this.chunkSize = 5 * 1024 * 1024;
+
+        this.downloadBuffer = [];
+        this.isRecording = false;
+        this.mp4InitSegment = null;
+
         this._resetState();
     }
 
-    log(msg) {
-        console.log("⚙️ Engine:", msg);
-    }
+    log(msg) { console.log("Engine:", msg); }
 
     _resetState() {
         this.isFetching = false;
@@ -224,10 +205,46 @@ class CoreEngine {
         this.currentStreamId = (this.currentStreamId || 0) + 1;
         this.currentOffset = 0;
         this.cueMap = [];
-        if (this.seekTimeout) clearTimeout(this.seekTimeout);
-        this.seekTimeout = null;
         this.audioTracks = [];
         this.sourceBuffer = null;
+    }
+
+    _bootAudioEncoder() {
+        if (this.audioEncoder && this.audioEncoder.state !== 'closed') {
+            try { this.audioEncoder.close(); } catch (e) { }
+        }
+
+        this.audioEncoder = new AudioEncoder({
+            output: (chunk, metadata) => {
+                const aacData = new Uint8Array(chunk.byteLength);
+                chunk.copyTo(aacData);
+                const aacPtr = wasm._alloc_memory(aacData.length);
+                new Uint8Array(getWasmMemory(), aacPtr, aacData.length).set(aacData);
+
+                const dtsSamples = BigInt(Math.floor((chunk.timestamp * 48000) / 1000000));
+
+                wasm._demuxer_append_aac(this.demuxer.ptr, aacPtr, aacData.length, dtsSamples);
+                wasm._free_memory(aacPtr, aacData.length);
+            },
+            error: (e) => console.error("Hardware Encoder Error:", e)
+        });
+
+        this.audioEncoder.configure({
+            codec: 'mp4a.40.2',
+            sampleRate: 48000,
+            numberOfChannels: 2,
+            bitrate: 128000
+        });
+        this.log("Hardware Audio Encoder rebuilt.");
+    }
+
+    attachVideo(videoElement) {
+        this.video = videoElement;
+        this.video.disableRemotePlayback = true;
+        this.video.onseeking = () => this._onSeeking();
+        this.video.ontimeupdate = () => this._onTimeUpdate();
+        this.video.src = URL.createObjectURL(this.mediaSource);
+        this.log("Video tag attached. Stream routed to screen.");
     }
 
     async preload(fetcher) {
@@ -235,18 +252,20 @@ class CoreEngine {
         this.sourceInput = fetcher;
         await this.sourceInput.init();
 
-        this.log("Probing for MKV clusters (Dynamic Streamed Preload)...");
+        this.log("Probing for MKV clusters...");
 
-        const maxProbe = 50 * 1024 * 1024;
+        const maxProbe = 100 * 1024 * 1024;
         let capacity = 2 * 1024 * 1024;
 
-        const wasm = await init();
+        if (!wasm) wasm = await initModule();
         let ptr = wasm._alloc_memory(capacity);
-        let wasmHeap = new Uint8Array(getWasmView().buffer, ptr, capacity);
+        let memBuffer = getWasmMemory();
+        let wasmHeap = new Uint8Array(memBuffer, ptr, capacity);
 
         let currentSize = 0;
         let absoluteFileOffset = 0;
         let clusterFound = false;
+        let firstClusterIndex = 0; // The clean slice marker
 
         while (!clusterFound && absoluteFileOffset < this.sourceInput.size && currentSize < maxProbe) {
             const probeController = new AbortController();
@@ -255,22 +274,19 @@ class CoreEngine {
             try {
                 for await (const chunk of this.sourceInput.stream(absoluteFileOffset, this.sourceInput.size, probeController.signal)) {
 
-                    // 1. WASM Memory reallocation (Bulletproof Edition)
                     if (currentSize + chunk.length > capacity) {
                         let oldPtr = ptr;
                         let oldCapacity = capacity;
                         capacity = Math.max(capacity * 2, currentSize + chunk.length);
                         ptr = wasm._alloc_memory(capacity);
-
-                        let freshBuffer = getWasmView().buffer;
-
+                        let freshBuffer = getWasmMemory();
                         let oldView = new Uint8Array(freshBuffer, oldPtr, currentSize);
                         let newWasmHeap = new Uint8Array(freshBuffer, ptr, capacity);
                         newWasmHeap.set(oldView);
                         wasm._free_memory(oldPtr, oldCapacity);
                         wasmHeap = newWasmHeap;
                     } else if (wasmHeap.buffer.byteLength === 0) {
-                        wasmHeap = new Uint8Array(getWasmView().buffer, ptr, capacity);
+                        wasmHeap = new Uint8Array(wasm.memory.buffer, ptr, capacity);
                     }
 
                     wasmHeap.set(chunk, currentSize);
@@ -282,8 +298,11 @@ class CoreEngine {
                     for (let i = scanStart; i < currentSize - 4; i++) {
                         if (wasmHeap[i] === 0x1F && wasmHeap[i + 1] === 0x43 &&
                             wasmHeap[i + 2] === 0xB6 && wasmHeap[i + 3] === 0x75) {
+
                             clusterFound = true;
                             this.firstClusterOffset = absoluteFileOffset - currentSize + i;
+                            firstClusterIndex = i; // Save exact byte where headers end
+
                             probeController.abort();
                             break;
                         }
@@ -292,12 +311,11 @@ class CoreEngine {
                             wasmHeap[i + 2] === 0xA4 && wasmHeap[i + 3] === 0x69) {
 
                             const vint = readVintJS(wasmHeap, i + 4, currentSize);
-
                             if (vint) {
                                 if (vint.value < 1024 * 1024) continue;
 
                                 const skipAmount = 4 + vint.length + vint.value;
-                                this.log(`🎯 Attachments detected! Size: ${(vint.value / 1024 / 1024).toFixed(2)} MB. Initiating Jump...`);
+                                this.log(`🎯 Attachments skipped! Size: ${(vint.value / 1024 / 1024).toFixed(2)} MB.`);
 
                                 const startOfBufferOffset = absoluteFileOffset - currentSize;
                                 absoluteFileOffset = startOfBufferOffset + i + skipAmount;
@@ -316,39 +334,35 @@ class CoreEngine {
             } catch (err) {
                 if (err?.name !== 'AbortError') throw err;
             }
-
             if (clusterFound) break;
         }
 
         if (!clusterFound) throw new Error("Could not find Video Track.");
 
-        this.log("Parsing metadata via Zero-Copy Rust pointer...");
+        // Clean slice so no cluster ends into the headers
+        this.initialHeaderData = wasmHeap.slice(0, firstClusterIndex);
 
-        this.initialHeaderData = wasmHeap.slice(0, currentSize);
-
-        let jsonPtr = wasm._get_mkv_info_fast(ptr, currentSize);
-        let jsonString = wasm.UTF8ToString(jsonPtr);
-        this.mkvHeader = JSON.parse(jsonString);
-
+        let jsonPtr = wasm._get_mkv_info_fast_json(ptr, currentSize);
+        this.mkvHeader = JSON.parse(wasm.UTF8ToString(jsonPtr));
+        wasm._free_string(jsonPtr);
         wasm._free_memory(ptr, capacity);
 
         const videoTrack = this.mkvHeader.tracks.find(t => t.track_type === "video");
         this.audioTracks = this.mkvHeader.tracks.filter(t => t.track_type === "audio");
         const audioTrack = this.audioTracks.length > 0 ? this.audioTracks[0] : null;
 
-        // FIXED: parse_cues Emscripten Memory Bridge
         if (this.mkvHeader.cues_position) {
             const pos = Number(this.mkvHeader.cues_position);
             const cuesData = await this.sourceInput.read(pos, this.sourceInput.size, null);
 
-            let cuesPtr = wasm._alloc_memory(cuesData.length);
-            getWasmView().set(cuesData, cuesPtr);
+            const cPtr = wasm._alloc_memory(cuesData.length);
+            new Uint8Array(getWasmMemory(), cPtr, cuesData.length).set(cuesData);
 
-            let jsonPtrCues = wasm._parse_cues(cuesPtr, cuesData.length);
-            let cuesString = wasm.UTF8ToString(jsonPtrCues);
+            let cJsonPtr = wasm._parse_cues_json(cPtr, cuesData.length);
+            this.cueMap = JSON.parse(wasm.UTF8ToString(cJsonPtr));
 
-            this.cueMap = JSON.parse(cuesString);
-            wasm._free_memory(cuesPtr, cuesData.length);
+            wasm._free_string(cJsonPtr);
+            wasm._free_memory(cPtr, cuesData.length);
         }
 
         const audioId = audioTrack ? BigInt(audioTrack.track_number) : 0n;
@@ -358,51 +372,78 @@ class CoreEngine {
             this.mkvHeader.duration * 1000, videoTrack.codec_id
         );
 
+        if (audioTrack) {
+            const audioMime = `audio/mp4; codecs="${audioTrack.codec_string}"`;
+            const canPlayNatively = MediaSource.isTypeSupported(audioMime);
+            const strictlyUnsupported = ["A_TRUEHD", "A_DTS"];
+
+            if (canPlayNatively && !strictlyUnsupported.includes(audioTrack.codec_id)) {
+                this.log(`Direct Play Supported! Bypassing Transcoder for: ${audioTrack.codec_id}`);
+                this.needsAudioTranscode = false;
+                this.demuxer.setTranscodeMode(false);
+            } else {
+                this.log(`Browser cannot direct-play ${audioTrack.codec_id}. Booting Transcoder`);
+                this.needsAudioTranscode = true;
+                this.demuxer.setTranscodeMode(true);
+                this._bootAudioEncoder();
+            }
+        }
+
         this.videoTrack = videoTrack;
         this.audioTrack = audioTrack;
 
-        this.log("✅ Engine Preloaded & Warmed up! Waiting for video tag...");
+        const MSE = window.ManagedMediaSource || window.MediaSource;
+        if (!MSE) return this.log("Error: MSE not supported.");
+
+        this.mediaSource = new MSE();
+        this.mediaSource.addEventListener('sourceopen', () => this._onSourceOpen());
     }
 
-    async start(needsFfmpeg = false) {
+    async _onSourceOpen() {
         try {
-            if (needsFfmpeg) this.log("🔊 FFmpeg Engine Engaged! Decoding Dolby to PCM...");
+            let mime = `video/mp4; codecs="${this.videoTrack.codec_string}`;
+            if (this.audioTrack) {
+                mime += this.needsAudioTranscode ? `, mp4a.40.2"` : `, ${this.audioTrack.codec_string}"`;
+            } else { mime += `"`; }
 
-            const audioId = this.audioTrack ? BigInt(this.audioTrack.track_number) : 0n;
-            this.demuxer = new Demuxer(
-                BigInt(this.videoTrack.track_number), audioId,
-                this.videoTrack.width, this.videoTrack.height,
-                this.mkvHeader.duration * 1000, this.videoTrack.codec_id,
-                needsFfmpeg
-            );
+            this.sourceBuffer = this.mediaSource.addSourceBuffer(mime);
+            this.sourceBuffer.mode = 'segments';
+            this.mediaSource.duration = this.mkvHeader.duration;
 
-            const initSegment = this.demuxer.init(this.initialHeaderData);
-            await this._appendToBuffer(initSegment);
+            await new Promise(r => setTimeout(r, 100));
 
-            this.currentOffset = this.cueMap.length > 0
-                ? Math.max(0, Number(this.cueMap[0].offset) - 100000)
-                : (this.firstClusterOffset || 0);
+            const initData = this.demuxer.init(this.initialHeaderData);
 
-            this.log("▶️ Worker Engine Started! Pumping chunks to Main Thread...");
+            this.mp4InitSegment = initData;
+
+            if (!initData || initData.length < 100) throw new Error("Invalid Init Segment from Rust");
+            await this._appendToBuffer(initData);
+
+            this.currentOffset = this.firstClusterOffset || 0;
+            this.log("▶️ Stream routed to screen. Buffering clusters...");
             this._streamLoop();
 
         } catch (error) {
-            console.error("Worker Engine Crash:", error);
+            console.error("Engine Crash in _onSourceOpen:", error);
         }
     }
 
     async _streamLoop() {
+        if (!this.sourceBuffer || this.mediaSource.readyState !== 'open') return;
+
         let myStreamId = this.currentStreamId;
         if (this.isFetching || this.currentOffset >= this.sourceInput.size) return;
         this.isFetching = true;
 
         while (this.currentOffset < this.sourceInput.size && myStreamId === this.currentStreamId) {
-
-            let limit = (this.bufferedEnd || 0) - (this.currentTime || 0);
-
-            if (limit > 60 || this.queueLength > 5) {
-                break;
+            let bufferedEnd = this.video ? this.video.currentTime : 0;
+            for (let i = 0; i < this.sourceBuffer.buffered.length; i++) {
+                let end = this.sourceBuffer.buffered.end(i);
+                if (end > bufferedEnd) bufferedEnd = end;
             }
+
+            let limit = this.video ? (bufferedEnd - this.video.currentTime) : bufferedEnd;
+            if (limit > 30) break;
 
             this.abortController = new AbortController();
             try {
@@ -414,21 +455,56 @@ class CoreEngine {
                     const isFinal = (this.currentOffset + bytesProcessed + chunkData.length) >= this.sourceInput.size;
                     const framesStaged = this.demuxer.parse_chunk(chunkData, isFinal);
 
-                    const pcmData = this.demuxer.get_pcm_data();
-                    if (pcmData && this.onAudioReady) {
-                        this.onAudioReady(pcmData);
+                    if (this.audioTrack && this.needsAudioTranscode && this.audioEncoder?.state === 'configured') {
+                        while (true) {
+                            const samples = wasm._demuxer_decode_next_audio_frame(this.demuxer.ptr);
+                            if (samples <= 0) break;
+
+                            const pcmPtr = wasm._get_audio_ptr();
+                            const dtsBigInt = wasm._demuxer_get_last_audio_dts(this.demuxer.ptr);
+
+                            const leftChannel = new Float32Array(getWasmMemory(), pcmPtr, samples).slice();
+                            const rightChannel = new Float32Array(getWasmMemory(), pcmPtr + 768000, samples).slice();
+
+                            const audioData = new AudioData({
+                                format: 'f32-planar',
+                                sampleRate: 48000,
+                                numberOfChannels: 2,
+                                numberOfFrames: samples,
+                                timestamp: (Number(dtsBigInt) * 1000000) / 48000,
+                                data: new Float32Array([...leftChannel, ...rightChannel])
+                            });
+
+                            this.audioEncoder.encode(audioData);
+                            audioData.close();
+                        }
+                        await new Promise(r => setTimeout(r, 1));
                     }
 
                     if (framesStaged >= 30 || isFinal) {
                         const segment = this.demuxer.get_mp4_segment();
 
-                        if (segment.length > 0) {
+                        if (this.isRecording && segment.length > 0) {
+                            this.downloadBuffer.push(new Uint8Array(segment));
+                        }
+
+                        if (segment.length > 0 && this.sourceBuffer) {
                             await this._appendToBuffer(segment);
-                            await new Promise(r => setTimeout(r, 0));
+
+                            // THE STARTUP NUDGE FIX
+                            if (this.video && this.video.currentTime === 0 && this.sourceBuffer.buffered.length > 0) {
+                                const start = this.sourceBuffer.buffered.start(0);
+                                if (start > 0 && start < 0.5) {
+                                    this.video.currentTime = start + 0.01;
+                                }
+                            }
+
+                            await new Promise(r => requestAnimationFrame(r));
                         }
                     }
                     bytesProcessed += chunkData.length;
                 }
+
                 this.currentOffset += bytesProcessed;
             } catch (err) {
                 if (err?.name === 'AbortError') break;
@@ -440,89 +516,240 @@ class CoreEngine {
         if (myStreamId === this.currentStreamId) this.isFetching = false;
     }
 
-    syncProgress(currentTime, bufferedEnd, queueLength) {
-        this.currentTime = currentTime;
-        this.bufferedEnd = bufferedEnd;
-        this.queueLength = queueLength || 0;
+    _onTimeUpdate() {
+        if (!this.sourceBuffer || !this.video || this.mediaSource.readyState !== 'open') return;
+        if (!this.video.paused && this.video.readyState <= 2) {
+            for (let i = 0; i < this.sourceBuffer.buffered.length; i++) {
+                let start = this.sourceBuffer.buffered.start(i);
+                if (start > this.video.currentTime && start - this.video.currentTime < 0.5) {
+                    this.video.currentTime = start + 0.01; break;
+                }
+            }
+        }
         this._streamLoop();
     }
 
-    seekTo(targetTime) {
-        this.log(`🕒 Worker Seeking to ${targetTime}s...`);
+    async _onSeeking() {
+        if (!this.video || !this.cueMap || this.cueMap.length === 0 || !this.mediaSource || this.mediaSource.readyState !== 'open') return;
         if (this.abortController) { this.abortController.abort(); this.abortController = null; }
-        if (this.seekTimeout) clearTimeout(this.seekTimeout);
+        if (this.isSeeking) return;
 
-        this.seekTimeout = setTimeout(async () => {
-            this.currentStreamId++;
-            if (this.demuxer) this.demuxer.reset();
-
-            let bestCue = this.cueMap[0];
-            for (let i = 0; i < this.cueMap.length; i++) {
-                if (this.cueMap[i].time <= targetTime) bestCue = this.cueMap[i];
-                else break;
-            }
-
-            // 🚨 FIX 1: Jump exactly to the Keyframe, no minus 100k hack!
-            this.currentOffset = bestCue ? Number(bestCue.offset) : 0;
-
-            // 🚨 FIX 2: Tell the main thread to snap the video to this exact Keyframe time
-            if (bestCue) {
-                postMessage({ type: 'SEEK_SNAP', payload: { time: bestCue.time } });
-            }
-
-            await new Promise(r => setTimeout(r, 300));
-            this.isFetching = false;
-            this._streamLoop();
-        }, 500);
-    }
-
-    async switchAudioTrack(newTrackNumber, currentVideoTime) {
-        this.log(`🎧 Worker: Hot-Swap Audio to ID: ${newTrackNumber}`);
-
-        if (this.abortController) {
-            this.abortController.abort();
-            this.abortController = null;
-        }
+        this.isSeeking = true;
         this.currentStreamId++;
 
-        const newAudioTrack = this.audioTracks.find(t => t.track_number === newTrackNumber);
-        if (!newAudioTrack) return console.error("Track not found!");
+        try {
+            if (this.sourceBuffer) {
+                if (this.sourceBuffer.updating) this.sourceBuffer.abort();
+                if (this.sourceBuffer.buffered.length > 0) {
+                    const wipeStart = Math.max(0, this.video.currentTime - 1);
+                    this.sourceBuffer.remove(wipeStart, this.mediaSource.duration);
+                    await new Promise(r => this.sourceBuffer.addEventListener('updateend', r, { once: true }));
+                }
+            }
+        } catch (e) { }
+
+        if (this.demuxer) this.demuxer.reset();
+        if (this.audioTrack) this._bootAudioEncoder();
+
+        let bestCue = this.cueMap[0];
+        for (let i = 0; i < this.cueMap.length; i++) {
+            if (this.cueMap[i].time <= this.video.currentTime) bestCue = this.cueMap[i];
+            else break;
+        }
+
+        const segmentPayloadStart = this.firstClusterOffset - Number(this.cueMap[0].offset);
+        this.currentOffset = segmentPayloadStart + Number(bestCue.offset);
+
+        this.isFetching = false;
+        this.isSeeking = false;
+        this._streamLoop();
+        try { await this.video.play(); } catch (e) { }
+    }
+
+    async switchAudioTrack(newTrackNumber) {
+        if (!this.video) return;
+        const targetTime = this.video.currentTime;
+        this.video.pause();
+
+        if (this.abortController) { this.abortController.abort(); this.abortController = null; }
+        if (this.isSeeking) return;
+        this.isSeeking = true;
+        this.currentStreamId++;
+
+        const newAudioTrack = this.audioTracks.find(t => t.track_number === Number(newTrackNumber));
+        if (!newAudioTrack) return;
         this.audioTrack = newAudioTrack;
 
+        try {
+            if (this.sourceBuffer) {
+                if (this.sourceBuffer.updating) this.sourceBuffer.abort();
+                if (this.sourceBuffer.buffered.length > 0) {
+                    this.sourceBuffer.remove(0, this.mediaSource.duration);
+                    await new Promise(r => this.sourceBuffer.addEventListener('updateend', r, { once: true }));
+                }
+            }
+        } catch (e) { }
+
+        if (this.demuxer) this.demuxer.destroy();
         this.demuxer = new Demuxer(
             BigInt(this.videoTrack.track_number), BigInt(newAudioTrack.track_number),
             this.videoTrack.width, this.videoTrack.height,
             this.mkvHeader.duration * 1000, this.videoTrack.codec_id
         );
 
-        const newInitSegment = this.demuxer.init(this.initialHeaderData);
+        if (this.audioTrack) {
+            const audioMime = `audio/mp4; codecs="${this.audioTrack.codec_string}"`;
+            const canPlayNatively = MediaSource.isTypeSupported(audioMime);
 
-        if (this.onAudioSwap) {
-            this.onAudioSwap(newInitSegment, newAudioTrack.codec_string);
+            // Only blacklist DTS and TrueHD
+            const strictlyUnsupported = ["A_TRUEHD", "A_DTS"];
+
+            if (canPlayNatively && !strictlyUnsupported.includes(this.audioTrack.codec_id)) {
+                this.needsAudioTranscode = false;
+                this.demuxer.setTranscodeMode(false);
+
+                if (this.audioEncoder && this.audioEncoder.state !== 'closed') {
+                    try { this.audioEncoder.close(); } catch (e) { }
+                }
+            } else {
+                this.needsAudioTranscode = true;
+                this.demuxer.setTranscodeMode(true);
+                this._bootAudioEncoder();
+            }
         }
 
-        this.seekTo(currentVideoTime);
+        const newInitSegment = this.demuxer.init(this.initialHeaderData);
+        await this._appendToBuffer(newInitSegment);
+
+        let bestCue = this.cueMap[0];
+        for (let i = 0; i < this.cueMap.length; i++) {
+            if (this.cueMap[i].time <= targetTime) bestCue = this.cueMap[i];
+            else break;
+        }
+
+        const segmentPayloadStart = this.firstClusterOffset - Number(this.cueMap[0].offset);
+        this.currentOffset = segmentPayloadStart + Number(bestCue.offset);
+
+        if (bestCue && Math.abs(this.video.currentTime - bestCue.time) > 0.2) {
+            this.video.currentTime = bestCue.time;
+        }
+
+        this.isFetching = false;
+        this.isSeeking = false;
+        this._streamLoop();
+        try { await this.video.play(); } catch (e) { }
     }
 
     async _appendToBuffer(data) {
-        if (this.onSegmentReady) {
-            this.onSegmentReady(data);
-        }
+        return new Promise((resolve, reject) => {
+            if (!this.sourceBuffer) return resolve();
+            if (this.sourceBuffer.updating) {
+                setTimeout(() => this._appendToBuffer(data).then(resolve).catch(reject), 50);
+                return;
+            }
+            try {
+                const onUpdate = () => { cleanup(); resolve(); };
+                const onError = (e) => { cleanup(); reject(e); };
+                const cleanup = () => {
+                    this.sourceBuffer.removeEventListener('updateend', onUpdate);
+                    this.sourceBuffer.removeEventListener('error', onError);
+                };
+                this.sourceBuffer.addEventListener('updateend', onUpdate);
+                this.sourceBuffer.addEventListener('error', onError);
+                this.sourceBuffer.appendBuffer(data);
+            } catch (e) { reject(e); }
+        });
     }
 }
 
+// --- EXPORTED SDK FUNCTIONS ---
 const streamDictionary = new Map();
-let isWasmLoaded = false;
 
-export async function feed(url) {
-    if (!isWasmLoaded) { await init(); isWasmLoaded = true; }
-    if (streamDictionary.has(url)) return streamDictionary.get(url);
+export async function feed(source) {
+    if (!wasm) { wasm = await initModule(); }
+    const dictKey = source instanceof File ? source.name : source;
 
-    console.log(`[SDK] Feeding stream: ${url}`);
-    const fetcher = new MKVFetcher('url', url);
+    if (streamDictionary.has(dictKey)) return streamDictionary.get(dictKey);
+
+    const fetcher = new MKVFetcher(source);
+    await fetcher.init();
+
     const engine = new CoreEngine();
     await engine.preload(fetcher);
 
-    streamDictionary.set(url, engine);
+    streamDictionary.set(dictKey, engine);
     return engine;
+}
+
+export class MKVPlayer {
+    constructor(videoElement) {
+        if (!videoElement) throw new Error("MKVPlayer requires a <video> element!");
+        this.video = videoElement;
+        this.engine = null;
+    }
+
+    async load(source) {
+        // Completely reset the video tag
+        if (this.video) {
+            this.video.pause();
+            this.video.currentTime = 0; // Reset the timeline
+            this.video.removeAttribute('src'); // Detach the old SourceBuffer
+            this.video.load(); // Force the browser to flush its video memory
+        }
+
+        const isFile = source instanceof File;
+        const dictKey = isFile ? source.name : source;
+
+        // 2. Load the new stream
+        if (!streamDictionary.has(dictKey)) {
+            await feed(source);
+        }
+
+        // 3. Attach the fresh engine
+        this.engine = streamDictionary.get(dictKey);
+        this.engine.attachVideo(this.video);
+    }
+
+    play() {
+        this.video.play().catch(e => {
+            if (e.name !== 'AbortError') console.error("Play prevented:", e);
+        });
+    }
+
+    pause() { this.video.pause(); }
+    seek(timeInSeconds) { this.video.currentTime = timeInSeconds; }
+    getAudioTracks() { return this.engine ? this.engine.audioTracks : []; }
+    setAudioTrack(trackNumber) { if (this.engine) this.engine.switchAudioTrack(trackNumber); }
+
+    toggleRecording(buttonElement) {
+        if (!this.engine) return;
+
+        if (!this.engine.isRecording) {
+            this.engine.isRecording = true;
+            this.engine.downloadBuffer = [];
+            if (this.engine.mp4InitSegment) {
+                this.engine.downloadBuffer.push(new Uint8Array(this.engine.mp4InitSegment));
+            }
+            buttonElement.innerText = "Stop & Save MP4";
+            buttonElement.style.background = "#ff4444";
+        } else {
+            this.engine.isRecording = false;
+            buttonElement.innerText = "⬇Save MP4 to Device";
+            buttonElement.style.background = "#28a745";
+
+            const blob = new Blob(this.engine.downloadBuffer, { type: 'video/mp4' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.style.display = 'none';
+            a.href = url;
+            a.download = 'Transcoded_Movie.mp4';
+
+            document.body.appendChild(a);
+            a.click();
+
+            window.URL.revokeObjectURL(url);
+            document.body.removeChild(a);
+            this.engine.downloadBuffer = [];
+        }
+    }
 }

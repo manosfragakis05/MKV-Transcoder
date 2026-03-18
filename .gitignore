@@ -1,0 +1,20 @@
+# Rust & Cargo Build Cache
+/streaming-engine/target/
+**/*.rs.bk
+
+# C & FFmpeg Source Code
+/streaming-engine/c_src/ffmpeg_src/
+*.o
+*.a
+*.so
+*.dylib
+
+/streaming-engine/pkg/.gitignore
+
+*.mkv
+*.mp4
+*.webm
+*.avi
+
+.DS_Store
+Thumbs.db

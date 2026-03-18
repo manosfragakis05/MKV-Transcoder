@@ -4,406 +4,197 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WASM MKV Worker Test Bench</title>
+    <title>MKV Hardware Transcoder</title>
     <style>
         body {
-            background: #111;
-            color: white;
-            font-family: sans-serif;
-            text-align: center;
+            font-family: system-ui, -apple-system, sans-serif;
+            background: #121212;
+            color: #ffffff;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
             padding: 20px;
+            box-sizing: border-box;
         }
 
-        video {
-            width: 80%;
-            max-width: 900px;
-            background: black;
-            border-radius: 8px;
-            margin-top: 20px;
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5);
+        .converter-card {
+            background: #1e1e1e;
+            padding: 2.5rem;
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+            width: 100%;
+            max-width: 600px;
+            /* Widened from 400px so the video looks good */
+            text-align: center;
         }
 
-        .controls {
-            margin-top: 20px;
-            background: #222;
-            padding: 15px;
-            border-radius: 8px;
-            display: inline-block;
+        h2 {
+            margin-top: 0;
         }
 
-        input {
-            width: 400px;
-            padding: 8px;
-            background: #333;
-            color: white;
-            border: 1px solid #555;
-            border-radius: 4px;
+        input[type="file"] {
+            margin: 1.5rem 0;
+            width: 100%;
+            padding: 10px;
+            background: #2a2a2a;
+            border-radius: 6px;
         }
 
-        button,
-        select {
-            padding: 8px 15px;
+        button {
             background: #007bff;
             color: white;
             border: none;
-            border-radius: 4px;
+            padding: 12px 24px;
+            font-size: 1rem;
+            border-radius: 6px;
             cursor: pointer;
             font-weight: bold;
+            width: 100%;
+            transition: background 0.2s;
         }
 
-        button:hover {
+        button:disabled {
+            background: #444;
+            cursor: not-allowed;
+            color: #888;
+        }
+
+        button:hover:not(:disabled) {
             background: #0056b3;
         }
 
-        select {
-            background: #444;
-            margin-left: 10px;
+        progress {
+            width: 100%;
+            height: 8px;
+            margin-top: 1.5rem;
+            border-radius: 4px;
+            appearance: none;
+        }
+
+        progress::-webkit-progress-bar {
+            background-color: #333;
+            border-radius: 4px;
+        }
+
+        progress::-webkit-progress-value {
+            background-color: #007bff;
+            border-radius: 4px;
+        }
+
+        #statusText {
+            margin-top: 1rem;
+            font-size: 0.85rem;
+            color: #aaa;
+        }
+
+        /* THE NEW VIDEO PLAYER */
+        video {
+            width: 100%;
+            margin-top: 1.5rem;
+            border-radius: 8px;
+            background: #000;
+            display: none;
+            /* Hidden by default */
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5);
+        }
+
+        #downloadBtn {
+            display: none;
+            background: #28a745;
+            text-decoration: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            color: white;
+            font-weight: bold;
+            margin-top: 1.5rem;
+        }
+
+        #downloadBtn:hover {
+            background: #218838;
         }
     </style>
 </head>
 
 <body>
 
-    <h2>⚙️ MKV Worker Engine Sandbox</h2>
+    <div class="converter-card">
+        <h2>MKV Transcoder Engine</h2>
+        <p style="color: #888; font-size: 0.9rem;">Hardware-accelerated Dolby to AAC</p>
 
-    <div class="controls">
-        <input type="text" id="urlInput" placeholder="Paste MKV/Magnet URL here...">
-        <button id="playBtn">Load Engine</button>
-        <select id="audioSelect" disabled>
-            <option>Audio Track...</option>
-        </select>
+        <label for="localFileInput" style="font-weight: bold; font-size: 0.9rem; color: #ccc;">📁 Select Local File:</label>
+        <input type="file" id="localFileInput" accept=".mkv" 
+            style="width: 100%; padding: 10px; margin: 0.5rem 0 1.5rem 0; background: #2a2a2a; border: 1px solid #444; color: white; border-radius: 6px;">
+
+        <div style="color: #666; font-size: 0.8rem; margin-bottom: 1rem;">— OR —</div>
+
+        <input type="url" id="urlInput" placeholder="Paste Torbox direct link here..."
+            style="width: 100%; padding: 10px; margin: 1.5rem 0; background: #2a2a2a; border: 1px solid #444; color: white; border-radius: 6px;">
+        <button id="startBtn">Start Player</button>
+
+        <progress id="progressBar" value="0" max="100"></progress>
+        <div id="statusText">Awaiting file...</div>
+
+        <div id="trackControls"
+            style="display: none; margin-top: 1rem; background: #2a2a2a; padding: 10px; border-radius: 6px; text-align: left;">
+            <label for="audioSelect" style="font-weight: bold; margin-right: 10px;">🎧 Audio Track:</label>
+            <select id="audioTrackSelect"
+                style="background: #1e1e1e; color: white; border: 1px solid #444; padding: 5px 10px; border-radius: 4px; cursor: pointer;">
+            </select>
+        </div>
+
+        <video id="videoPlayer" controls></video>
+
+        <a id="downloadBtn" href="#">⬇️ Save MP4 to Device</a>
     </div>
 
-    <br>
-    <video id="videoPlayer" controls></video>
-
     <script type="module">
-        const video = document.getElementById('videoPlayer');
-        const urlInput = document.getElementById('urlInput');
-        const playBtn = document.getElementById('playBtn');
-        const audioSelect = document.getElementById('audioSelect');
-        let isProgrammaticSeek = false;
+        import { MKVPlayer } from './mkv_lib.js';
 
-        let isRemoving = false;
+        const videoElement = document.getElementById('videoPlayer');
+        const player = new MKVPlayer(videoElement);
 
-        let worker = null;
-        // Web Audio API Speakers
-        let audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
-        let nextAudioTime = 0;
+        // Boot Button
+        document.getElementById('startBtn').addEventListener('click', async () => {
+            const fileInput = document.getElementById('localFileInput').files[0];
+            const urlInput = document.getElementById('urlInput').value;
+            
+            const targetSource = fileInput ? fileInput : urlInput;
 
-        let activeSources = [];
-
-        let mediaSource = null;
-        let sourceBuffer = null;
-        let bufferQueue = [];
-        let syncInterval = null;
-        let savedVideoCodec = ""; // We save this for audio hot-swaps!
-
-        const processQueue = () => {
-            // If the buffer is busy, or we are currently cleaning RAM, STOP!
-            if (!sourceBuffer || sourceBuffer.updating || isRemoving || bufferQueue.length === 0) return;
-            try {
-                sourceBuffer.appendBuffer(bufferQueue.shift());
-            } catch (e) {
-                console.error("🚨 Append Error (Pipeline locked):", e);
-            }
-        };
-
-        playBtn.onclick = () => {
-            const url = urlInput.value.trim();
-            if (!url) return alert("Paste a URL first!");
-
-            console.log("🚀 Booting Worker Sandbox...");
-
-            // 1. Reset everything if we are hitting play again
-            if (worker) worker.terminate();
-            if (syncInterval) clearInterval(syncInterval);
-            bufferQueue = [];
-            video.pause();
-
-            // 2. Spawn the Dark Room
-            worker = new Worker('worker.js', { type: 'module' });
-            worker.onerror = (err) => console.error("🚨 WORKER FATAL CRASH:", err); mediaSource = new MediaSource();
-            video.src = URL.createObjectURL(mediaSource);
-
-            mediaSource.addEventListener('sourceopen', () => {
-                // Send the URL to the worker to start the Rust engine
-                worker.postMessage({ type: 'INIT', payload: { url: url } });
-            }, { once: true });
-
-            // 3. Listen to the Worker
-            worker.onmessage = (e) => {
-                const { type } = e.data;
-
-                if (type === 'READY') {
-                    console.log("✅ Worker Ready! Tracks:", e.data.audioTracks);
-                    mediaSource.duration = e.data.duration;
-                    savedVideoCodec = e.data.videoTrack.codec_string;
-
-                    let mime = `video/mp4; codecs="${savedVideoCodec}`;
-                    let needsFfmpeg = false;
-
-                    if (e.data.audioTracks.length > 0) {
-                        let audioCodec = e.data.audioTracks[0].codec_string;
-                        let testMime = mime + `, ${audioCodec}"`;
-
-                        // Ask the browser: Can you play this natively?
-                        if (MediaSource.isTypeSupported(testMime)) {
-                            console.log(`✅ Browser supports ${audioCodec} natively!`);
-                            mime = testMime;
-                        } else {
-                            console.warn(`🚨 Browser blocked ${audioCodec}! Rerouting to WASM FFmpeg...`);
-                            mime += `"`; // Close the video-only string
-                            needsFfmpeg = true;
-                        }
-                    } else {
-                        mime += `"`;
-                    }
-
-                    // (Your existing MIME checking logic is here)
-                    sourceBuffer = mediaSource.addSourceBuffer(mime);
-                    sourceBuffer.mode = 'segments';
-                    sourceBuffer.addEventListener('updateend', processQueue);
-
-                    // --- TELL THE WORKER TO START WITH OR WITHOUT FFMPEG ---
-                    worker.postMessage({
-                        type: 'START',
-                        payload: { needsFfmpeg: needsFfmpeg }
-                    });
-
-                    // Populate the Audio Dropdown
-                    audioSelect.innerHTML = '';
-                    e.data.audioTracks.forEach((t, i) => {
-                        let opt = document.createElement('option');
-                        opt.value = t.track_number;
-                        opt.text = `${t.language.toUpperCase()} (Track ${t.track_number})`;
-                        audioSelect.appendChild(opt);
-                    });
-                    audioSelect.disabled = false;
-
-                    video.play();
-
-                    processQueue();
-                }
-                else if (type === 'APPEND') {
-                    bufferQueue.push(e.data.data);
-                    processQueue();
-                }
-                else if (type === 'AUDIO_SWAP') {
-                    console.log("🎧 Applying Audio Hot-Swap Blueprint...");
-                    if (sourceBuffer.updating) sourceBuffer.abort();
-                    bufferQueue = [];
-
-                    let testMime = `video/mp4; codecs="${savedVideoCodec}, ${e.data.codecString}"`;
-                    let finalMime = `video/mp4; codecs="${savedVideoCodec}"`;
-
-                    if (MediaSource.isTypeSupported(testMime)) {
-                        console.log(`✅ Browser supports ${e.data.codecString} natively!`);
-                        finalMime = testMime;
-                    } else {
-                        console.warn(`🚨 Browser blocked ${e.data.codecString} on swap! Rerouting to WASM FFmpeg...`);
-                    }
-
-                    if (typeof sourceBuffer.changeType === 'function') {
-                        try { sourceBuffer.changeType(finalMime); } catch (e) { console.warn("changeType ignored", e); }
-                    }
-
-                    activeSources.forEach(source => {
-                        try { source.stop(); } catch (err) { }
-                    });
-                    activeSources = [];
-                    nextAudioTime = 0;
-
-                    // 🚨 THE FIX: Wait for the buffer to clear before appending!
-                    if (sourceBuffer.buffered.length > 0) {
-                        sourceBuffer.addEventListener('updateend', function onRemoveEnd() {
-                            sourceBuffer.removeEventListener('updateend', onRemoveEnd);
-                            // Now that it's empty, push the new Init Segment
-                            bufferQueue.push(e.data.initSegment);
-                            processQueue();
-                        }, { once: true });
-
-                        sourceBuffer.remove(0, mediaSource.duration); // Nuke the whole buffer to ensure a clean sync
-                    } else {
-                        bufferQueue.push(e.data.initSegment);
-                        processQueue();
-                    }
-                }
-                else if (type === 'PCM_DATA') {
-                    if (audioCtx.state === 'suspended' && !video.paused) {
-                        audioCtx.resume();
-                    }
-
-                    console.log(`🎵 Audio Arrived! Samples: ${e.data.data.length} | Speaker State: ${audioCtx.state}`);
-
-                    const floats = e.data.data;
-                    const frameCount = floats.length / 2;
-                    const audioBuffer = audioCtx.createBuffer(2, frameCount, 48000);
-
-                    // De-interleave C-style [L,R, L,R] to Web Audio [L,L], [R,R]
-                    const left = audioBuffer.getChannelData(0);
-                    const right = audioBuffer.getChannelData(1);
-                    for (let i = 0; i < frameCount; i++) {
-                        left[i] = floats[i * 2];
-                        right[i] = floats[i * 2 + 1];
-                    }
-
-                    const source = audioCtx.createBufferSource();
-                    source.buffer = audioBuffer;
-                    source.connect(audioCtx.destination);
-
-                    // --- NEW SYNC & ANTI-POP LOGIC ---
-                    // If we fell behind the hardware clock, snap to present + 50ms safety buffer.
-                    // This 50ms gap gives the hardware time to breathe and completely kills the "pop" noise!
-                    if (nextAudioTime < audioCtx.currentTime) {
-                        nextAudioTime = audioCtx.currentTime + 0.05;
-                    }
-
-                    // Trap the source so we can nuke it later if the user seeks!
-                    activeSources.push(source);
-                    source.onended = () => {
-                        // Clean up memory after it finishes playing
-                        activeSources = activeSources.filter(s => s !== source);
-                    };
-
-                    source.start(nextAudioTime);
-                    nextAudioTime += audioBuffer.duration;
-                }
-            };
-
-            // 4. The Sync Pulse & Gap Jumper
-            syncInterval = setInterval(() => {
-                if (video.readyState === 0 || !sourceBuffer) return;
-
-                // --- 1. THE GAP JUMPER ---
-                if (video.readyState <= 2 && sourceBuffer.buffered.length > 0) {
-                    for (let i = 0; i < sourceBuffer.buffered.length; i++) {
-                        let start = sourceBuffer.buffered.start(i);
-                        // If playhead is stuck just milliseconds behind the real video data...
-                        if (video.currentTime < start && (start - video.currentTime) < 1.5) {
-                            console.log(`🦘 Gap Jump: Nudging from ${video.currentTime.toFixed(3)} to ${start.toFixed(3)}`);
-                            isProgrammaticSeek = true;
-                            video.currentTime = start + 0.05; // Jump into the safe zone
-                            break;
-                        }
-                    }
-                }
-
-                // --- 2. THE RAM JANITOR (Defeats the 800MB limit) ---
-                if (!sourceBuffer.updating && !isRemoving && video.currentTime > 30) {
-                    let bufferedStart = sourceBuffer.buffered.length > 0 ? sourceBuffer.buffered.start(0) : 0;
-                    let removeEnd = video.currentTime - 15; // Keep the last 15 seconds for rewinding
-
-                    if (removeEnd > bufferedStart + 5) { // Only clean if there's a big enough chunk
-                        isRemoving = true;
-                        sourceBuffer.addEventListener('updateend', function onCleanEnd() {
-                            sourceBuffer.removeEventListener('updateend', onCleanEnd);
-                            isRemoving = false;
-                            processQueue(); // Resume pumping video!
-                        }, { once: true });
-
-                        sourceBuffer.remove(bufferedStart, removeEnd);
-                    }
-                }
-
-                // --- 3. THE WORKER SYNC ---
-                let bufferedEnd = 0;
-                for (let i = 0; i < sourceBuffer.buffered.length; i++) {
-                    if (sourceBuffer.buffered.end(i) > bufferedEnd) bufferedEnd = sourceBuffer.buffered.end(i);
-                }
-
-                worker.postMessage({
-                    type: 'SYNC',
-                    payload: {
-                        currentTime: video.currentTime,
-                        bufferedEnd: bufferedEnd,
-                        queueLength: bufferQueue.length
-                    }
-                });
-            }, 250);
-        };
-
-        // 🛡️ The Invincible Seek Handler
-        video.addEventListener('seeking', () => {
-            if (isProgrammaticSeek) {
-                isProgrammaticSeek = false;
+            if (!targetSource) {
+                alert("Please select a file or paste a link first!");
                 return;
             }
 
-            if (!worker || !sourceBuffer) return;
-            console.log("🔥 Initiating Invincible Seek: Locking Pipeline...");
+            await player.load(targetSource);
+            
+            videoElement.style.display = 'block';
+            document.getElementById('trackControls').style.display = 'block';
 
-            // 1. Kill the Ghost Audio Queue
-            activeSources.forEach(source => { try { source.stop(); } catch (e) { } });
-            activeSources = [];
-            nextAudioTime = 0;
+            player.play();
 
-            // 2. Lock the video pipeline
-            bufferQueue = [];
-            if (sourceBuffer.updating) sourceBuffer.abort();
-
-            // 3. NUKE THE RAM! Delete all video currently in memory to guarantee a clean slate.
-            if (sourceBuffer.buffered.length > 0) {
-                isRemoving = true;
-                sourceBuffer.addEventListener('updateend', function onNukeEnd() {
-                    sourceBuffer.removeEventListener('updateend', onNukeEnd);
-                    isRemoving = false;
-
-                    console.log(`🚀 RAM Cleared. Telling Worker to jump to ${video.currentTime}s`);
-                    worker.postMessage({ type: 'SEEK', payload: { time: video.currentTime } });
-                }, { once: true });
-
-                // Erase from 0 to the very end of the movie
-                sourceBuffer.remove(0, mediaSource.duration || 999999);
-            } else {
-                worker.postMessage({ type: 'SEEK', payload: { time: video.currentTime } });
-            }
-        });
-
-        // 6. The A/V Sync Locks (Fixes the immediate drift!)
-        // 'waiting' fires when the video is buffering but hasn't paused.
-        video.addEventListener('waiting', () => {
-            if (audioCtx && audioCtx.state === 'running') {
-                audioCtx.suspend().then(() => console.log("⏳ Video Buffering... Audio Suspended!"));
-            }
-        });
-
-        // 'playing' fires when the video actually has enough data to move.
-        video.addEventListener('playing', () => {
-            if (audioCtx && audioCtx.state === 'suspended') {
-                audioCtx.resume().then(() => console.log("🏃 Video Moving... Audio Resumed!"));
-            }
-        });
-
-        // (Keep your existing 'pause' and 'play' listeners exactly as they are down here!)
-
-        // --- UPDATED: Wired to audioCtx! ---
-        video.addEventListener('pause', () => {
-            if (audioCtx && audioCtx.state === 'running') {
-                audioCtx.suspend().then(() => {
-                    console.log("⏸️ Audio Clock Suspended!");
-                });
-            }
-        });
-
-        video.addEventListener('play', () => {
-            if (audioCtx && audioCtx.state === 'suspended') {
-                audioCtx.resume().then(() => {
-                    console.log("▶️ Audio Clock Resumed!");
-                });
-            }
-        });
-
-        // 6. Handle the Audio Dropdown
-        audioSelect.addEventListener('change', (e) => {
-            if (!worker) return;
-            const targetTrackId = parseInt(e.target.value);
-            worker.postMessage({
-                type: 'SWITCH_AUDIO',
-                payload: { trackId: targetTrackId, currentTime: video.currentTime }
+            // Populate your Audio UI
+            const tracks = player.getAudioTracks();
+            const select = document.getElementById('audioTrackSelect');
+            select.innerHTML = '';
+            tracks.forEach(t => {
+                const opt = document.createElement('option');
+                opt.value = t.track_number;
+                opt.innerText = `Track ${t.track_number}: ${t.codec_id} (${t.language})`;
+                select.appendChild(opt);
             });
         });
 
+        // Audio Dropdown
+        document.getElementById('audioTrackSelect').addEventListener('change', (e) => {
+            player.setAudioTrack(e.target.value);
+        });
+
+        // Download Button
+        document.getElementById('downloadBtn').addEventListener('click', () => {
+            // later
+        });
     </script>
 </body>
 
