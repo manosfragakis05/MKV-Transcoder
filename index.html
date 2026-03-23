@@ -3,6 +3,8 @@
 
 <head>
     <meta charset="UTF-8">
+    <script src="https://cdn.jsdelivr.net/npm/eruda"></script>
+    <script>eruda.init();</script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MKV Hardware Transcoder</title>
     <style>
@@ -123,8 +125,9 @@
         <h2>MKV Transcoder Engine</h2>
         <p style="color: #888; font-size: 0.9rem;">Hardware-accelerated Dolby to AAC</p>
 
-        <label for="localFileInput" style="font-weight: bold; font-size: 0.9rem; color: #ccc;">📁 Select Local File:</label>
-        <input type="file" id="localFileInput" accept=".mkv" 
+        <label for="localFileInput" style="font-weight: bold; font-size: 0.9rem; color: #ccc;">📁 Select Local
+            File:</label>
+        <input type="file" id="localFileInput" accept=".mkv"
             style="width: 100%; padding: 10px; margin: 0.5rem 0 1.5rem 0; background: #2a2a2a; border: 1px solid #444; color: white; border-radius: 6px;">
 
         <div style="color: #666; font-size: 0.8rem; margin-bottom: 1rem;">— OR —</div>
@@ -144,7 +147,7 @@
             </select>
         </div>
 
-        <video id="videoPlayer" controls></video>
+        <video id="videoPlayer" playsinline controls></video>
 
         <a id="downloadBtn" href="#">⬇️ Save MP4 to Device</a>
     </div>
@@ -159,7 +162,7 @@
         document.getElementById('startBtn').addEventListener('click', async () => {
             const fileInput = document.getElementById('localFileInput').files[0];
             const urlInput = document.getElementById('urlInput').value;
-            
+
             const targetSource = fileInput ? fileInput : urlInput;
 
             if (!targetSource) {
@@ -168,9 +171,10 @@
             }
 
             await player.load(targetSource);
-            
+
             videoElement.style.display = 'block';
             document.getElementById('trackControls').style.display = 'block';
+            document.getElementById('downloadBtn').style.display = 'block';
 
             player.play();
 
@@ -191,9 +195,29 @@
             player.setAudioTrack(e.target.value);
         });
 
-        // Download Button
-        document.getElementById('downloadBtn').addEventListener('click', () => {
-            // later
+        downloadBtn.addEventListener('click', () => {
+            player.toggleRecording(
+                // 1. The onStateChange Callback
+                (state) => {
+                    if (state === "recording") {
+                        videoElement.style.opacity = "0.2";
+                        videoElement.style.pointerEvents = "none";
+
+                        downloadBtn.style.background = "#ff4444";
+                    } else if (state === "stopped") {
+                        videoElement.style.opacity = "1";
+                        videoElement.style.pointerEvents = "auto";
+
+                        downloadBtn.innerText = "⬇ Save MP4 to Device";
+                        downloadBtn.style.background = "#28a745";
+                    }
+                },
+                // 2. The onProgress Callback
+                (percent) => {
+                    downloadBtn.innerText = `🛑 Stop (${percent}%)`;
+                    downloadBtn.style.background = `linear-gradient(90deg, #ff4444 ${percent}%, #444444 ${percent}%)`;
+                }
+            );
         });
     </script>
 </body>

@@ -300,6 +300,11 @@ struct Frame {
     ctts: i32,
 }
 
+struct MfraEntry {
+    time: u64,
+    offset: u64,
+}
+
 pub struct Demuxer {
     buffer: Vec<u8>,
     video_track_id: u64,
@@ -325,6 +330,10 @@ pub struct Demuxer {
     last_segment_len: usize,
     current_cluster_time: u64,
     needs_sync: bool,
+
+    mfra_ledger: Vec<MfraEntry>,
+    absolute_file_offset: u64,
+    init_segment_len: u64,
 }
 
 impl Demuxer {
@@ -361,6 +370,9 @@ impl Demuxer {
             last_segment_len: 0,
             current_cluster_time: 0,
             needs_sync: true,
+            mfra_ledger: Vec::new(),
+            absolute_file_offset: 0,
+            init_segment_len: 0,
         }
     }
 
@@ -373,6 +385,12 @@ impl Demuxer {
         self.base_decode_time = 0;
         self.audio_base_decode_time = 0;
         self.needs_sync = true;
+
+        self.mfra_ledger.clear();
+        
+        self.absolute_file_offset = self.init_segment_len;
+
+        self.seq_number = 1;
     }
 
     pub fn init(&mut self, chunk: &[u8]) -> Result<Vec<u8>, String> {
@@ -763,6 +781,10 @@ impl Demuxer {
         }
 
         end_box(&mut mp4, moov);
+
+        self.absolute_file_offset = mp4.len() as u64;
+        self.init_segment_len = self.absolute_file_offset;
+        
         Ok(mp4)
     }
 
@@ -964,6 +986,20 @@ impl Demuxer {
             return Vec::new();
         }
 
+        let mut has_keyframe = false;
+        let mut keyframe_dts = 0;
+        if !self.staged_video_frames.is_empty() && self.staged_video_frames[0].is_keyframe {
+            has_keyframe = true;
+            keyframe_dts = self.staged_video_frames[0].dts;
+        }
+        
+        if has_keyframe {
+            self.mfra_ledger.push(MfraEntry {
+                time: keyframe_dts,
+                offset: self.absolute_file_offset,
+            });
+        }
+
         let mut moof = Vec::new();
         let header = start_box(&mut moof, b"moof");
         let mfhd = start_box(&mut moof, b"mfhd");
@@ -1070,6 +1106,8 @@ impl Demuxer {
         self.staged_video_frames.clear();
         self.staged_audio_frames.clear();
 
+        self.absolute_file_offset += segment.len() as u64;
+
         segment
     }
 }
@@ -1151,7 +1189,54 @@ pub extern "C" fn demuxer_get_mp4_segment(ptr: *mut Demuxer) -> u32 {
     segment_ptr as u32
 }
 
-// NEW: JS calls this to get the length!
+#[no_mangle]
+pub extern "C" fn demuxer_get_mfra_box(ptr: *mut Demuxer) -> u32 {
+    let demuxer = unsafe { &mut *ptr };
+
+    let mut tfra: Vec<u8> = Vec::new();
+    
+    tfra.extend_from_slice(&[0, 0, 0, 0, b't', b'f', b'r', b'a']); 
+    tfra.extend_from_slice(&[1, 0, 0, 0]); // Version 1
+    tfra.extend_from_slice(&1u32.to_be_bytes()); // Track ID = 1
+    tfra.extend_from_slice(&[0, 0, 0, 0]); // lengths
+
+    let entry_count = demuxer.mfra_ledger.len() as u32;
+    tfra.extend_from_slice(&entry_count.to_be_bytes());
+
+    for entry in &demuxer.mfra_ledger {
+        tfra.extend_from_slice(&entry.time.to_be_bytes());
+        tfra.extend_from_slice(&entry.offset.to_be_bytes());
+        tfra.extend_from_slice(&[1, 1, 1]); // traf/trun/sample defaults
+    }
+
+    let tfra_size = tfra.len() as u32;
+    tfra[0..4].copy_from_slice(&tfra_size.to_be_bytes());
+
+    let mut mfro: Vec<u8> = Vec::new();
+    let mfro_size: u32 = 16;
+    let total_mfra_size = 8 + tfra_size + mfro_size;
+
+    mfro.extend_from_slice(&mfro_size.to_be_bytes());
+    mfro.extend_from_slice(b"mfro");
+    mfro.extend_from_slice(&[0, 0, 0, 0]);
+    mfro.extend_from_slice(&total_mfra_size.to_be_bytes());
+
+    let mut mfra: Vec<u8> = Vec::new();
+    mfra.extend_from_slice(&total_mfra_size.to_be_bytes());
+    mfra.extend_from_slice(b"mfra");
+    mfra.extend_from_slice(&tfra);
+    mfra.extend_from_slice(&mfro);
+
+    // Pass to JS
+    let mut boxed_slice = mfra.into_boxed_slice();
+    demuxer.last_segment_len = boxed_slice.len(); 
+    let segment_ptr = boxed_slice.as_mut_ptr();
+    std::mem::forget(boxed_slice);
+
+    segment_ptr as u32
+}
+
+// JS calls this to get the length
 #[no_mangle]
 pub extern "C" fn demuxer_get_last_len(ptr: *mut Demuxer) -> u32 {
     let demuxer = unsafe { &mut *ptr };

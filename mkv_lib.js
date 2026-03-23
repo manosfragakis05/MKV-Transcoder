@@ -1,6 +1,15 @@
 import initModule from './streaming-engine/target/wasm32-unknown-emscripten/release/streaming-engine.js';
 let wasm = null;
 
+const MSE = window.ManagedMediaSource || window.MediaSource;
+
+// Bypasses background tab throttling
+const yieldThread = () => new Promise(resolve => {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = resolve;
+    channel.port2.postMessage(null);
+});
+
 // Memory unlocker
 function getWasmMemory() {
     if (wasm.HEAPU8 && wasm.HEAPU8.buffer) return wasm.HEAPU8.buffer;
@@ -172,6 +181,12 @@ class Demuxer {
         return this._handleBufferResult(ptr);
     }
 
+    get_mfra_box() {
+        if (!wasm._demuxer_get_mfra_box) return new Uint8Array(0); // Safety check
+        const ptr = wasm._demuxer_get_mfra_box(this.ptr);
+        return this._handleBufferResult(ptr);
+    }
+
     parse_chunk(chunkData, isFinal) {
         const chunkPtr = wasm._alloc_memory(chunkData.length);
         new Uint8Array(getWasmMemory(), chunkPtr, chunkData.length).set(chunkData);
@@ -207,6 +222,9 @@ class CoreEngine {
         this.cueMap = [];
         this.audioTracks = [];
         this.sourceBuffer = null;
+
+        this.audioFramesIn = 0;
+        this.audioFramesOut = 0;
     }
 
     _bootAudioEncoder() {
@@ -216,6 +234,8 @@ class CoreEngine {
 
         this.audioEncoder = new AudioEncoder({
             output: (chunk, metadata) => {
+                this.audioFramesOut++;
+
                 const aacData = new Uint8Array(chunk.byteLength);
                 chunk.copyTo(aacData);
                 const aacPtr = wasm._alloc_memory(aacData.length);
@@ -351,6 +371,12 @@ class CoreEngine {
         this.audioTracks = this.mkvHeader.tracks.filter(t => t.track_type === "audio");
         const audioTrack = this.audioTracks.length > 0 ? this.audioTracks[0] : null;
 
+        if (videoTrack.codec_id !== "V_MPEG4/ISO/AVC" && videoTrack.codec_id !== "V_MPEGH/ISO/HEVC") {
+            this.log(`Critical: Unsupported video codec ${videoTrack.codec_id}`);
+            alert(`Sorry, only H.264 and HEVC (H.265) video tracks are supported!`);
+            throw new Error("Unsupported video codec.");
+        }
+
         if (this.mkvHeader.cues_position) {
             const pos = Number(this.mkvHeader.cues_position);
             const cuesData = await this.sourceInput.read(pos, this.sourceInput.size, null);
@@ -372,10 +398,16 @@ class CoreEngine {
             this.mkvHeader.duration * 1000, videoTrack.codec_id
         );
 
+        
         if (audioTrack) {
             const audioMime = `audio/mp4; codecs="${audioTrack.codec_string}"`;
-            const canPlayNatively = MediaSource.isTypeSupported(audioMime);
-            const strictlyUnsupported = ["A_TRUEHD", "A_DTS"];
+            
+            let canPlayNatively = false;
+            if (!MSE) return this.log("Error: MSE not supported.");
+            try { canPlayNatively = MSE.isTypeSupported(audioMime); } catch (e) {}
+
+            // The absolute safety net for your Rust engine!
+            const strictlyUnsupported = ["A_TRUEHD", "A_DTS", "A_AC3", "A_EAC3"];
 
             if (canPlayNatively && !strictlyUnsupported.includes(audioTrack.codec_id)) {
                 this.log(`Direct Play Supported! Bypassing Transcoder for: ${audioTrack.codec_id}`);
@@ -385,15 +417,12 @@ class CoreEngine {
                 this.log(`Browser cannot direct-play ${audioTrack.codec_id}. Booting Transcoder`);
                 this.needsAudioTranscode = true;
                 this.demuxer.setTranscodeMode(true);
-                this._bootAudioEncoder();
+                this._bootAudioEncoder(); // WAKE UP THE HARDWARE!
             }
         }
 
         this.videoTrack = videoTrack;
         this.audioTrack = audioTrack;
-
-        const MSE = window.ManagedMediaSource || window.MediaSource;
-        if (!MSE) return this.log("Error: MSE not supported.");
 
         this.mediaSource = new MSE();
         this.mediaSource.addEventListener('sourceopen', () => this._onSourceOpen());
@@ -436,14 +465,26 @@ class CoreEngine {
         this.isFetching = true;
 
         while (this.currentOffset < this.sourceInput.size && myStreamId === this.currentStreamId) {
+            if (this.mediaSource.readyState !== 'open') break;
+            
             let bufferedEnd = this.video ? this.video.currentTime : 0;
+
             for (let i = 0; i < this.sourceBuffer.buffered.length; i++) {
                 let end = this.sourceBuffer.buffered.end(i);
                 if (end > bufferedEnd) bufferedEnd = end;
             }
 
+            try {
+                for (let i = 0; i < this.sourceBuffer.buffered.length; i++) {
+                    let end = this.sourceBuffer.buffered.end(i);
+                    if (end > bufferedEnd) bufferedEnd = end;
+                }
+            } catch (e) {
+                break; // Buffer was removed, kill the loop cleanly
+            }
+
             let limit = this.video ? (bufferedEnd - this.video.currentTime) : bufferedEnd;
-            if (limit > 30) break;
+            if (limit > 30 && !this.isRecording) break;
 
             this.abortController = new AbortController();
             try {
@@ -477,32 +518,55 @@ class CoreEngine {
 
                             this.audioEncoder.encode(audioData);
                             audioData.close();
+
+                            this.audioFramesIn++;
                         }
-                        await new Promise(r => setTimeout(r, 1));
+                       // 🛑 THE ASYNC FIX: Wait for the queue to empty!
+                        while (this.audioEncoder.encodeQueueSize > 0) {
+                            await yieldThread(); // Wait without getting throttled!
+                        }
+                        
+                        // Give the JS event loop one microsecond to run the output() callbacks
+                        await yieldThread();
                     }
 
                     if (framesStaged >= 30 || isFinal) {
                         const segment = this.demuxer.get_mp4_segment();
 
-                        if (this.isRecording && segment.length > 0) {
-                            this.downloadBuffer.push(new Uint8Array(segment));
+                        if (this.isRecording && this.diskStream && segment.length > 0) {
+                            // Stream directly to hard drive at maximum speed!
+                            await this.diskStream.write(segment);
                         }
 
-                        if (segment.length > 0 && this.sourceBuffer) {
+                        if (isFinal && this.isRecording && this.diskStream) {
+                            console.log("✅ Reached EOF. Generating MFRA box...");
+
+                            if (this.onDownloadProgress) this.onDownloadProgress(100);
+                        }
+
+                        if (segment.length > 0 && this.sourceBuffer && !this.isRecording) {
                             await this._appendToBuffer(segment);
 
-                            // THE STARTUP NUDGE FIX
-                            if (this.video && this.video.currentTime === 0 && this.sourceBuffer.buffered.length > 0) {
-                                const start = this.sourceBuffer.buffered.start(0);
-                                if (start > 0 && start < 0.5) {
-                                    this.video.currentTime = start + 0.01;
+                            // Startup Nugde 
+                            try {
+                                if (this.video && this.video.currentTime === 0 && this.sourceBuffer.buffered.length > 0) {
+                                    const start = this.sourceBuffer.buffered.start(0);
+                                    if (start > 0 && start < 0.5) {
+                                        this.video.currentTime = start + 0.01;
+                                    }
                                 }
-                            }
+                            } catch (e) {}
 
-                            await new Promise(r => requestAnimationFrame(r));
+                            await yieldThread();
                         }
                     }
                     bytesProcessed += chunkData.length;
+
+                    if (this.isRecording && this.onDownloadProgress && this.sourceInput.size !== Infinity) {
+                        const currentBytes = this.currentOffset + bytesProcessed;
+                        const percent = Math.floor((currentBytes / this.sourceInput.size) * 100);
+                        this.onDownloadProgress(percent);
+                    }
                 }
 
                 this.currentOffset += bytesProcessed;
@@ -549,7 +613,7 @@ class CoreEngine {
         } catch (e) { }
 
         if (this.demuxer) this.demuxer.reset();
-        if (this.audioTrack) this._bootAudioEncoder();
+        if (this.audioTrack && this.needsAudioTranscode) this._bootAudioEncoder();
 
         let bestCue = this.cueMap[0];
         for (let i = 0; i < this.cueMap.length; i++) {
@@ -599,7 +663,7 @@ class CoreEngine {
 
         if (this.audioTrack) {
             const audioMime = `audio/mp4; codecs="${this.audioTrack.codec_string}"`;
-            const canPlayNatively = MediaSource.isTypeSupported(audioMime);
+            const canPlayNatively = MSE.isTypeSupported(audioMime);
 
             // Only blacklist DTS and TrueHD
             const strictlyUnsupported = ["A_TRUEHD", "A_DTS"];
@@ -642,7 +706,10 @@ class CoreEngine {
 
     async _appendToBuffer(data) {
         return new Promise((resolve, reject) => {
-            if (!this.sourceBuffer) return resolve();
+            if (!this.sourceBuffer || this.mediaSource.readyState !== 'open') {
+                return resolve(); 
+            }
+            
             if (this.sourceBuffer.updating) {
                 setTimeout(() => this._appendToBuffer(data).then(resolve).catch(reject), 50);
                 return;
@@ -660,13 +727,33 @@ class CoreEngine {
             } catch (e) { reject(e); }
         });
     }
+
+    _runGarbageCollector() {
+        if (!this.sourceBuffer || this.sourceBuffer.updating || this.mediaSource.readyState !== 'open') return;
+
+        const currentTime = this.video ? this.video.currentTime : 0;
+        // Keep 30 seconds of video behind the current timestamp, delete the rest
+        const safeBackBuffer = 30; 
+        
+        if (currentTime > safeBackBuffer) {
+            try {
+                // Remove from the very beginning of the buffer up to (currentTime - 30)
+                this.sourceBuffer.remove(0, currentTime - safeBackBuffer);
+                this.log(`🗑️ Garbage Collector: Flushed buffer from 0 to ${currentTime - safeBackBuffer}`);
+            } catch (e) {
+                this.log(`Garbage collection skipped: ${e.message}`);
+            }
+        }
+    }
 }
 
 // --- EXPORTED SDK FUNCTIONS ---
 const streamDictionary = new Map();
 
 export async function feed(source) {
-    if (!wasm) { wasm = await initModule(); }
+    wasm = await initModule(); //Always make new space 
+
+
     const dictKey = source instanceof File ? source.name : source;
 
     if (streamDictionary.has(dictKey)) return streamDictionary.get(dictKey);
@@ -689,23 +776,30 @@ export class MKVPlayer {
     }
 
     async load(source) {
+        if (this.engine) {
+            this.engine.currentStreamId++; 
+            if (this.engine.abortController) this.engine.abortController.abort();
+        }
+
         // Completely reset the video tag
         if (this.video) {
             this.video.pause();
-            this.video.currentTime = 0; // Reset the timeline
-            this.video.removeAttribute('src'); // Detach the old SourceBuffer
-            this.video.load(); // Force the browser to flush its video memory
+            this.video.currentTime = 0; 
+            this.video.removeAttribute('src'); 
+            this.video.load(); 
         }
 
         const isFile = source instanceof File;
         const dictKey = isFile ? source.name : source;
 
-        // 2. Load the new stream
-        if (!streamDictionary.has(dictKey)) {
-            await feed(source);
-        }
+        // 2. Delete the dead engine from the dictionary! 
+        // Reusing a detached MediaSource is illegal in Chrome/Safari.
+        streamDictionary.delete(dictKey);
 
-        // 3. Attach the fresh engine
+        // 3. Load the new stream
+        await feed(source);
+
+        // 4. Attach the fresh engine
         this.engine = streamDictionary.get(dictKey);
         this.engine.attachVideo(this.video);
     }
@@ -721,35 +815,99 @@ export class MKVPlayer {
     getAudioTracks() { return this.engine ? this.engine.audioTracks : []; }
     setAudioTrack(trackNumber) { if (this.engine) this.engine.switchAudioTrack(trackNumber); }
 
-    toggleRecording(buttonElement) {
+    async toggleRecording(onStateChange, onProgress, customName = "Media") {
         if (!this.engine) return;
 
         if (!this.engine.isRecording) {
-            this.engine.isRecording = true;
-            this.engine.downloadBuffer = [];
-            if (this.engine.mp4InitSegment) {
-                this.engine.downloadBuffer.push(new Uint8Array(this.engine.mp4InitSegment));
+            try {
+                if (!window.showSaveFilePicker) {
+                    alert("Direct-to-disk saving is currently only supported on Desktop Chrome/Edge/Opera.");
+                    return;
+                }
+
+                const fileHandle = await window.showSaveFilePicker({
+                    suggestedName: customName,
+                    types: [{ description: 'MP4 Video', accept: { 'video/mp4': ['.mp4'] } }],
+                });
+
+                this.engine.diskStream = await fileHandle.createWritable();
+                this.engine.isRecording = true;
+
+                this.video.pause(); 
+
+                // 🛑 1. WIPE THE RUST ENGINE CLEAN (Resets sequence to 1 and fixes timestamps)
+                if (this.engine.demuxer) this.engine.demuxer.reset();
+
+                // 🛑 2. WIPE THE AUDIO ENCODER CLEAN (Destroys ghost frames)
+                if (this.engine.audioTrack && this.engine.needsAudioTranscode) this.engine._bootAudioEncoder();
+
+                // 🛑 3. WRITE THE MP4 HEADERS
+                if (this.engine.mp4InitSegment) {
+                    await this.engine.diskStream.write(new Uint8Array(this.engine.mp4InitSegment));
+                }
+
+                this.engine.onDownloadProgress = (percent) => {
+                    if (onProgress) onProgress(percent);
+                    if (percent >= 100) this._finishRecording(onStateChange);
+                };
+
+                // 🛑 4. JUMP TO THE TRUE START OF THE VIDEO (Skips MKV text headers!)
+                this.engine.currentOffset = this.engine.firstClusterOffset || 0;
+                this.engine.currentStreamId++; 
+                
+                this.engine.isFetching = false;
+                this.engine._streamLoop(); 
+
+                if (onStateChange) onStateChange("recording");
+
+            } catch (err) {
+                console.log("User cancelled the save dialog:", err);
             }
-            buttonElement.innerText = "Stop & Save MP4";
-            buttonElement.style.background = "#ff4444";
         } else {
-            this.engine.isRecording = false;
-            buttonElement.innerText = "⬇Save MP4 to Device";
-            buttonElement.style.background = "#28a745";
-
-            const blob = new Blob(this.engine.downloadBuffer, { type: 'video/mp4' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.style.display = 'none';
-            a.href = url;
-            a.download = 'Transcoded_Movie.mp4';
-
-            document.body.appendChild(a);
-            a.click();
-
-            window.URL.revokeObjectURL(url);
-            document.body.removeChild(a);
-            this.engine.downloadBuffer = [];
+            // User manually clicked stop
+            this._finishRecording(onStateChange);
         }
+    }
+
+    async _finishRecording(onStateChange) {
+        if (!this.engine || !this.engine.isRecording) return;
+        
+        // 1. Immediately stop the stream loop from fetching new chunks
+        this.engine.isRecording = false;
+        this.engine.onDownloadProgress = null; 
+
+        if (this.engine.diskStream) {
+            console.log("🛑 Commencing graceful shutdown...");
+
+            // 2. FLUSH THE AUDIO ENCODER (Fixes the missing audio/dropped buffers!)
+            if (this.engine.audioEncoder && this.engine.audioEncoder.state === 'configured') {
+                try {
+                    console.log("Flushing hardware audio encoder...");
+                    await this.engine.audioEncoder.flush();
+                } catch (e) { console.warn("Audio flush skipped:", e); }
+            }
+
+            if (this.engine.demuxer) {
+                // 3. Package any trailing audio frames that just flushed
+                const finalSegment = this.engine.demuxer.get_mp4_segment();
+                if (finalSegment && finalSegment.length > 0) {
+                    await this.engine.diskStream.write(finalSegment);
+                }
+
+                // 4. WRITE THE MFRA CHEAT SHEET (Fixes seeking on early stops!)
+                const mfraBox = this.engine.demuxer.get_mfra_box();
+                if (mfraBox && mfraBox.length > 0) {
+                    //await this.engine.diskStream.write(mfraBox);
+                    console.log(`📦 MFRA box appended (${mfraBox.length} bytes).`);
+                }
+            }
+
+            // 5. Safely lock the vault
+            await this.engine.diskStream.close();
+            this.engine.diskStream = null;
+            console.log("✅ File successfully saved and closed.");
+        }
+
+        if (onStateChange) onStateChange("stopped");
     }
 }
