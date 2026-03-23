@@ -1,4 +1,4 @@
-import initModule from './streaming-engine/target/wasm32-unknown-emscripten/release/streaming-engine.js';
+import initModule from './wasm-lib/streaming-engine.js';
 let wasm = null;
 
 const MSE = window.ManagedMediaSource || window.MediaSource;
