@@ -107,8 +107,14 @@ class MKVFetcher {
                 if (done) break;
                 yield value;
             }
+        } catch (err) {
+            if (err.name !== 'AbortError') throw err;
         } finally {
             reader.releaseLock();
+            // 🛑 THE FIX: Forcefully kill the HTTP connection when we stop reading!
+            if (streamObj && typeof streamObj.cancel === 'function') {
+                streamObj.cancel().catch(() => { });
+            }
         }
     }
 }
@@ -202,7 +208,7 @@ class Demuxer {
 class CoreEngine {
     constructor() {
         this.video = null;
-        this.chunkSize = 5 * 1024 * 1024;
+        this.chunkSize = 10 * 1024 * 1024;
 
         this.downloadBuffer = [];
         this.isRecording = false;
@@ -263,6 +269,10 @@ class CoreEngine {
         this.video.disableRemotePlayback = true;
         this.video.onseeking = () => this._onSeeking();
         this.video.ontimeupdate = () => this._onTimeUpdate();
+
+        this.video.onwaiting = () => this._streamLoop();
+        this.video.onstalled = () => this._streamLoop();
+
         this.video.src = URL.createObjectURL(this.mediaSource);
         this.log("Video tag attached. Stream routed to screen.");
     }
@@ -398,13 +408,13 @@ class CoreEngine {
             this.mkvHeader.duration * 1000, videoTrack.codec_id
         );
 
-        
+
         if (audioTrack) {
             const audioMime = `audio/mp4; codecs="${audioTrack.codec_string}"`;
-            
+
             let canPlayNatively = false;
             if (!MSE) return this.log("Error: MSE not supported.");
-            try { canPlayNatively = MSE.isTypeSupported(audioMime); } catch (e) {}
+            try { canPlayNatively = MSE.isTypeSupported(audioMime); } catch (e) { }
 
             // The absolute safety net for your Rust engine!
             const strictlyUnsupported = ["A_TRUEHD", "A_DTS", "A_AC3", "A_EAC3"];
@@ -466,7 +476,7 @@ class CoreEngine {
 
         while (this.currentOffset < this.sourceInput.size && myStreamId === this.currentStreamId) {
             if (this.mediaSource.readyState !== 'open') break;
-            
+
             let bufferedEnd = this.video ? this.video.currentTime : 0;
 
             for (let i = 0; i < this.sourceBuffer.buffered.length; i++) {
@@ -483,8 +493,21 @@ class CoreEngine {
                 break; // Buffer was removed, kill the loop cleanly
             }
 
+            // THE NEW DYNAMIC RAM LIMITER
             let limit = this.video ? (bufferedEnd - this.video.currentTime) : bufferedEnd;
-            if (limit > 30 && !this.isRecording) break;
+
+            // 1. Calculate the average bytes per second of the current video
+            // (Using Math.max to prevent divide-by-zero if the duration header is missing)
+            const durationSeconds = Math.max(this.mkvHeader.duration, 1);
+            const bytesPerSecond = this.sourceInput.size / durationSeconds;
+
+            // 2. Convert the forward buffer time into Megabytes
+            let forwardBufferMB = (limit * bytesPerSecond) / (1024 * 1024);
+
+            // 3. Stop fetching if we have parked more than 50MB in the browser's RAM
+            if (forwardBufferMB > 50 && !this.isRecording) {
+                break;
+            }
 
             this.abortController = new AbortController();
             try {
@@ -496,7 +519,10 @@ class CoreEngine {
                     const isFinal = (this.currentOffset + bytesProcessed + chunkData.length) >= this.sourceInput.size;
                     const framesStaged = this.demuxer.parse_chunk(chunkData, isFinal);
 
+                    // THE NEW, SAFE CODE inside _streamLoop
                     if (this.audioTrack && this.needsAudioTranscode && this.audioEncoder?.state === 'configured') {
+                        let framesEncoded = 0;
+                        // THE NEW, SAFE CODE
                         while (true) {
                             const samples = wasm._demuxer_decode_next_audio_frame(this.demuxer.ptr);
                             if (samples <= 0) break;
@@ -518,15 +544,15 @@ class CoreEngine {
 
                             this.audioEncoder.encode(audioData);
                             audioData.close();
-
                             this.audioFramesIn++;
                         }
-                       // 🛑 THE ASYNC FIX: Wait for the queue to empty!
-                        while (this.audioEncoder.encodeQueueSize > 0) {
-                            await yieldThread(); // Wait without getting throttled!
+
+                        // Wait for the encoder queue to empty naturally WITHOUT forcing a flush.
+                        // Any leftover samples (like the 512 from AC3) will safely stay inside 
+                        // the encoder until the next chunk provides the rest of the frame!
+                        while (this.audioEncoder && this.audioEncoder.encodeQueueSize > 0 && this.audioEncoder.state === 'configured') {
+                            await yieldThread();
                         }
-                        
-                        // Give the JS event loop one microsecond to run the output() callbacks
                         await yieldThread();
                     }
 
@@ -546,16 +572,17 @@ class CoreEngine {
 
                         if (segment.length > 0 && this.sourceBuffer && !this.isRecording) {
                             await this._appendToBuffer(segment);
+                            await this._runGarbageCollector();
 
                             // Startup Nugde 
                             try {
                                 if (this.video && this.video.currentTime === 0 && this.sourceBuffer.buffered.length > 0) {
                                     const start = this.sourceBuffer.buffered.start(0);
-                                    if (start > 0 && start < 0.5) {
+                                    if (start > 0) {
                                         this.video.currentTime = start + 0.01;
                                     }
                                 }
-                            } catch (e) {}
+                            } catch (e) { }
 
                             await yieldThread();
                         }
@@ -585,7 +612,7 @@ class CoreEngine {
         if (!this.video.paused && this.video.readyState <= 2) {
             for (let i = 0; i < this.sourceBuffer.buffered.length; i++) {
                 let start = this.sourceBuffer.buffered.start(i);
-                if (start > this.video.currentTime && start - this.video.currentTime < 0.5) {
+                if (start > this.video.currentTime) {
                     this.video.currentTime = start + 0.01; break;
                 }
             }
@@ -595,6 +622,27 @@ class CoreEngine {
 
     async _onSeeking() {
         if (!this.video || !this.cueMap || this.cueMap.length === 0 || !this.mediaSource || this.mediaSource.readyState !== 'open') return;
+
+        // 🛑 THE DEADLOCK FIX: Stop the player from nuking itself on micro-nudges
+        if (this.sourceBuffer) {
+            let target = this.video.currentTime;
+            let isBuffered = false;
+            for (let i = 0; i < this.sourceBuffer.buffered.length; i++) {
+                // If the seek destination is already inside our downloaded buffer...
+                if (target >= this.sourceBuffer.buffered.start(i) && target < this.sourceBuffer.buffered.end(i)) {
+                    isBuffered = true;
+                    break;
+                }
+            }
+            if (isBuffered) {
+                // The browser already has the data and will handle the seek natively.
+                // Do NOT abort the fetch loop, and do NOT reset the Rust demuxer!
+                return;
+            }
+        }
+
+        // If we reach here, the user clicked a part of the timeline we haven't downloaded yet.
+        // It is now safe to abort the current fetch and jump to the new file position.
         if (this.abortController) { this.abortController.abort(); this.abortController = null; }
         if (this.isSeeking) return;
 
@@ -635,15 +683,11 @@ class CoreEngine {
         const targetTime = this.video.currentTime;
         this.video.pause();
 
+        // 1. Kill the current fetch loop immediately
         if (this.abortController) { this.abortController.abort(); this.abortController = null; }
-        if (this.isSeeking) return;
-        this.isSeeking = true;
-        this.currentStreamId++;
+        this.currentStreamId++; 
 
-        const newAudioTrack = this.audioTracks.find(t => t.track_number === Number(newTrackNumber));
-        if (!newAudioTrack) return;
-        this.audioTrack = newAudioTrack;
-
+        // 2. Wipe the old video buffer so we can inject a new MP4 format
         try {
             if (this.sourceBuffer) {
                 if (this.sourceBuffer.updating) this.sourceBuffer.abort();
@@ -654,67 +698,78 @@ class CoreEngine {
             }
         } catch (e) { }
 
+        // 3. Tear down the old Rust engine and build a new one
         if (this.demuxer) this.demuxer.destroy();
+        
+        const newAudioTrack = this.audioTracks.find(t => t.track_number === Number(newTrackNumber));
+        if (!newAudioTrack) return;
+        this.audioTrack = newAudioTrack;
+
         this.demuxer = new Demuxer(
             BigInt(this.videoTrack.track_number), BigInt(newAudioTrack.track_number),
             this.videoTrack.width, this.videoTrack.height,
             this.mkvHeader.duration * 1000, this.videoTrack.codec_id
         );
 
+        // 4. Configure transcoding for the new track
         if (this.audioTrack) {
             const audioMime = `audio/mp4; codecs="${this.audioTrack.codec_string}"`;
             const canPlayNatively = MSE.isTypeSupported(audioMime);
-
-            // Only blacklist DTS and TrueHD
+            // Only blacklist DTS and TrueHD from native playback
             const strictlyUnsupported = ["A_TRUEHD", "A_DTS"];
 
             if (canPlayNatively && !strictlyUnsupported.includes(this.audioTrack.codec_id)) {
                 this.needsAudioTranscode = false;
                 this.demuxer.setTranscodeMode(false);
-
                 if (this.audioEncoder && this.audioEncoder.state !== 'closed') {
                     try { this.audioEncoder.close(); } catch (e) { }
                 }
             } else {
                 this.needsAudioTranscode = true;
                 this.demuxer.setTranscodeMode(true);
-                this._bootAudioEncoder();
+                // 🛑 NO _bootAudioEncoder() CALL HERE. _onSeeking will handle it!
             }
         }
 
+        // 5. Send the new MP4 headers to the browser
         const newInitSegment = this.demuxer.init(this.initialHeaderData);
         await this._appendToBuffer(newInitSegment);
 
+        // 6. Hand the keys over to _onSeeking() to cleanly restart playback
         let bestCue = this.cueMap[0];
         for (let i = 0; i < this.cueMap.length; i++) {
             if (this.cueMap[i].time <= targetTime) bestCue = this.cueMap[i];
             else break;
         }
 
-        const segmentPayloadStart = this.firstClusterOffset - Number(this.cueMap[0].offset);
-        this.currentOffset = segmentPayloadStart + Number(bestCue.offset);
-
-        if (bestCue && Math.abs(this.video.currentTime - bestCue.time) > 0.2) {
-            this.video.currentTime = bestCue.time;
+        // Force the video to jump to the keyframe. 
+        // This automatically triggers the browser's "seeking" event to start the loop!
+        if (bestCue && this.video.currentTime !== bestCue.time) {
+            this.video.currentTime = bestCue.time; 
+        } else {
+            // If we are miraculously exactly on the cue frame, trigger it manually
+            this._onSeeking();
         }
-
-        this.isFetching = false;
-        this.isSeeking = false;
-        this._streamLoop();
-        try { await this.video.play(); } catch (e) { }
     }
 
+    // THE NEW, SAFE CODE
     async _appendToBuffer(data) {
         return new Promise((resolve, reject) => {
             if (!this.sourceBuffer || this.mediaSource.readyState !== 'open') {
-                return resolve(); 
+                return resolve();
             }
-            
+
             if (this.sourceBuffer.updating) {
                 setTimeout(() => this._appendToBuffer(data).then(resolve).catch(reject), 50);
                 return;
             }
             try {
+                // If we just reset the demuxer (e.g., after a seek), Rust's internal clock 
+                // is back to 0. We must tell the browser to offset the incoming chunks.
+                if (this.isSeeking && this.video) {
+                    this.sourceBuffer.timestampOffset = this.video.currentTime;
+                }
+
                 const onUpdate = () => { cleanup(); resolve(); };
                 const onError = (e) => { cleanup(); reject(e); };
                 const cleanup = () => {
@@ -723,22 +778,36 @@ class CoreEngine {
                 };
                 this.sourceBuffer.addEventListener('updateend', onUpdate);
                 this.sourceBuffer.addEventListener('error', onError);
+
                 this.sourceBuffer.appendBuffer(data);
             } catch (e) { reject(e); }
         });
     }
 
-    _runGarbageCollector() {
+    async _runGarbageCollector() {
         if (!this.sourceBuffer || this.sourceBuffer.updating || this.mediaSource.readyState !== 'open') return;
 
         const currentTime = this.video ? this.video.currentTime : 0;
-        // Keep 30 seconds of video behind the current timestamp, delete the rest
-        const safeBackBuffer = 30; 
-        
+        const safeBackBuffer = 30; // Keep 30 seconds of history
+
+        // Only delete if we actually have more than 30 seconds of history
         if (currentTime > safeBackBuffer) {
             try {
-                // Remove from the very beginning of the buffer up to (currentTime - 30)
-                this.sourceBuffer.remove(0, currentTime - safeBackBuffer);
+                await new Promise((resolve, reject) => {
+                    const onUpdate = () => { cleanup(); resolve(); };
+                    const onError = (e) => { cleanup(); reject(e); };
+                    const cleanup = () => {
+                        this.sourceBuffer.removeEventListener('updateend', onUpdate);
+                        this.sourceBuffer.removeEventListener('error', onError);
+                    };
+                    
+                    this.sourceBuffer.addEventListener('updateend', onUpdate);
+                    this.sourceBuffer.addEventListener('error', onError);
+
+                    // Start the asynchronous deletion
+                    this.sourceBuffer.remove(0, currentTime - safeBackBuffer);
+                });
+                
                 this.log(`🗑️ Garbage Collector: Flushed buffer from 0 to ${currentTime - safeBackBuffer}`);
             } catch (e) {
                 this.log(`Garbage collection skipped: ${e.message}`);
@@ -777,16 +846,16 @@ export class MKVPlayer {
 
     async load(source) {
         if (this.engine) {
-            this.engine.currentStreamId++; 
+            this.engine.currentStreamId++;
             if (this.engine.abortController) this.engine.abortController.abort();
         }
 
         // Completely reset the video tag
         if (this.video) {
             this.video.pause();
-            this.video.currentTime = 0; 
-            this.video.removeAttribute('src'); 
-            this.video.load(); 
+            this.video.currentTime = 0;
+            this.video.removeAttribute('src');
+            this.video.load();
         }
 
         const isFile = source instanceof File;
@@ -833,7 +902,7 @@ export class MKVPlayer {
                 this.engine.diskStream = await fileHandle.createWritable();
                 this.engine.isRecording = true;
 
-                this.video.pause(); 
+                this.video.pause();
 
                 // 🛑 1. WIPE THE RUST ENGINE CLEAN (Resets sequence to 1 and fixes timestamps)
                 if (this.engine.demuxer) this.engine.demuxer.reset();
@@ -853,10 +922,10 @@ export class MKVPlayer {
 
                 // 🛑 4. JUMP TO THE TRUE START OF THE VIDEO (Skips MKV text headers!)
                 this.engine.currentOffset = this.engine.firstClusterOffset || 0;
-                this.engine.currentStreamId++; 
-                
+                this.engine.currentStreamId++;
+
                 this.engine.isFetching = false;
-                this.engine._streamLoop(); 
+                this.engine._streamLoop();
 
                 if (onStateChange) onStateChange("recording");
 
@@ -871,10 +940,10 @@ export class MKVPlayer {
 
     async _finishRecording(onStateChange) {
         if (!this.engine || !this.engine.isRecording) return;
-        
+
         // 1. Immediately stop the stream loop from fetching new chunks
         this.engine.isRecording = false;
-        this.engine.onDownloadProgress = null; 
+        this.engine.onDownloadProgress = null;
 
         if (this.engine.diskStream) {
             console.log("🛑 Commencing graceful shutdown...");
