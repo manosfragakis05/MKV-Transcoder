@@ -1,4 +1,4 @@
-import initModule from './wasm-lib/streaming-engine.js';
+import initModule from './streaming-engine/target/wasm32-unknown-emscripten/release/streaming-engine.js';
 let wasm = null;
 
 const MSE = window.ManagedMediaSource || window.MediaSource;
@@ -208,7 +208,7 @@ class Demuxer {
 class CoreEngine {
     constructor() {
         this.video = null;
-        this.chunkSize = 10 * 1024 * 1024;
+        this.chunkSize = 5 * 1024 * 1024;
 
         this.downloadBuffer = [];
         this.isRecording = false;
@@ -272,6 +272,7 @@ class CoreEngine {
 
         this.video.onwaiting = () => this._streamLoop();
         this.video.onstalled = () => this._streamLoop();
+        window.addEventListener('online', () => { this._streamLoop(); });
 
         this.video.src = URL.createObjectURL(this.mediaSource);
         this.log("Video tag attached. Stream routed to screen.");
@@ -572,19 +573,27 @@ class CoreEngine {
 
                         if (segment.length > 0 && this.sourceBuffer && !this.isRecording) {
                             await this._appendToBuffer(segment);
-                            await this._runGarbageCollector();
 
-                            // Startup Nugde 
+                            // 🛑 THE NEW, SAFE NUDGE BLOCK
                             try {
-                                if (this.video && this.video.currentTime === 0 && this.sourceBuffer.buffered.length > 0) {
-                                    const start = this.sourceBuffer.buffered.start(0);
-                                    if (start > 0) {
-                                        this.video.currentTime = start + 0.01;
+                                if (this.video && this.sourceBuffer.buffered.length > 0) {
+                                    // 1. Explicit Autostart (No more accidental seek-starts!)
+                                    if (this.video.currentTime === 0 && this.video.paused) {
+                                        this.video.play().catch(() => { });
+                                    }
+
+                                    // 2. Safe Gap Jump (Only jump true gaps, no artificial kicks!)
+                                    if (!this.video.paused && this.video.readyState <= 2) {
+                                        for (let i = 0; i < this.sourceBuffer.buffered.length; i++) {
+                                            let start = this.sourceBuffer.buffered.start(i);
+                                            if (start > this.video.currentTime) {
+                                                this.video.currentTime = start + 0.01;
+                                                break;
+                                            }
+                                        }
                                     }
                                 }
                             } catch (e) { }
-
-                            await yieldThread();
                         }
                     }
                     bytesProcessed += chunkData.length;
@@ -599,7 +608,11 @@ class CoreEngine {
                 this.currentOffset += bytesProcessed;
             } catch (err) {
                 if (err?.name === 'AbortError') break;
-                else { console.error(err); break; }
+                else {
+                    console.error("Fetch error:", err);
+                    await new Promise(r => setTimeout(r, 3000)); // The Wifi backoff!
+                    break;
+                }
             } finally {
                 this.abortController = null;
             }
@@ -609,14 +622,8 @@ class CoreEngine {
 
     _onTimeUpdate() {
         if (!this.sourceBuffer || !this.video || this.mediaSource.readyState !== 'open') return;
-        if (!this.video.paused && this.video.readyState <= 2) {
-            for (let i = 0; i < this.sourceBuffer.buffered.length; i++) {
-                let start = this.sourceBuffer.buffered.start(i);
-                if (start > this.video.currentTime) {
-                    this.video.currentTime = start + 0.01; break;
-                }
-            }
-        }
+        
+        this._runGarbageCollector(); 
         this._streamLoop();
     }
 
@@ -628,30 +635,26 @@ class CoreEngine {
             let target = this.video.currentTime;
             let isBuffered = false;
             for (let i = 0; i < this.sourceBuffer.buffered.length; i++) {
-                // If the seek destination is already inside our downloaded buffer...
                 if (target >= this.sourceBuffer.buffered.start(i) && target < this.sourceBuffer.buffered.end(i)) {
                     isBuffered = true;
                     break;
                 }
             }
-            if (isBuffered) {
-                // The browser already has the data and will handle the seek natively.
-                // Do NOT abort the fetch loop, and do NOT reset the Rust demuxer!
-                return;
-            }
+            if (isBuffered) return;
         }
 
-        // If we reach here, the user clicked a part of the timeline we haven't downloaded yet.
-        // It is now safe to abort the current fetch and jump to the new file position.
         if (this.abortController) { this.abortController.abort(); this.abortController = null; }
         if (this.isSeeking) return;
 
         this.isSeeking = true;
         this.currentStreamId++;
 
+        // 🛑 THE FATAL DOUBLE-WIPE FIX: Clean, single execution!
         try {
             if (this.sourceBuffer) {
-                if (this.sourceBuffer.updating) this.sourceBuffer.abort();
+                if (this.sourceBuffer.updating) {
+                    await new Promise(r => this.sourceBuffer.addEventListener('updateend', r, { once: true }));
+                }
                 if (this.sourceBuffer.buffered.length > 0) {
                     const wipeStart = Math.max(0, this.video.currentTime - 1);
                     this.sourceBuffer.remove(wipeStart, this.mediaSource.duration);
@@ -683,14 +686,19 @@ class CoreEngine {
         const targetTime = this.video.currentTime;
         this.video.pause();
 
+        // 🛑 IOS FIX 1: Temporarily unhook the seeking event so it doesn't double-wipe!
+        this.video.onseeking = null;
+
         // 1. Kill the current fetch loop immediately
         if (this.abortController) { this.abortController.abort(); this.abortController = null; }
-        this.currentStreamId++; 
+        this.currentStreamId++;
 
-        // 2. Wipe the old video buffer so we can inject a new MP4 format
+        // 2. Safely wipe the old video buffer (No aborting allowed on iOS!)
         try {
             if (this.sourceBuffer) {
-                if (this.sourceBuffer.updating) this.sourceBuffer.abort();
+                if (this.sourceBuffer.updating) {
+                    await new Promise(r => this.sourceBuffer.addEventListener('updateend', r, { once: true }));
+                }
                 if (this.sourceBuffer.buffered.length > 0) {
                     this.sourceBuffer.remove(0, this.mediaSource.duration);
                     await new Promise(r => this.sourceBuffer.addEventListener('updateend', r, { once: true }));
@@ -700,7 +708,7 @@ class CoreEngine {
 
         // 3. Tear down the old Rust engine and build a new one
         if (this.demuxer) this.demuxer.destroy();
-        
+
         const newAudioTrack = this.audioTracks.find(t => t.track_number === Number(newTrackNumber));
         if (!newAudioTrack) return;
         this.audioTrack = newAudioTrack;
@@ -715,8 +723,7 @@ class CoreEngine {
         if (this.audioTrack) {
             const audioMime = `audio/mp4; codecs="${this.audioTrack.codec_string}"`;
             const canPlayNatively = MSE.isTypeSupported(audioMime);
-            // Only blacklist DTS and TrueHD from native playback
-            const strictlyUnsupported = ["A_TRUEHD", "A_DTS"];
+            const strictlyUnsupported = ["A_TRUEHD", "A_DTS", "A_AC3", "A_EAC3"];
 
             if (canPlayNatively && !strictlyUnsupported.includes(this.audioTrack.codec_id)) {
                 this.needsAudioTranscode = false;
@@ -727,7 +734,7 @@ class CoreEngine {
             } else {
                 this.needsAudioTranscode = true;
                 this.demuxer.setTranscodeMode(true);
-                // 🛑 NO _bootAudioEncoder() CALL HERE. _onSeeking will handle it!
+                this._bootAudioEncoder(); // Boot it cleanly here
             }
         }
 
@@ -735,21 +742,31 @@ class CoreEngine {
         const newInitSegment = this.demuxer.init(this.initialHeaderData);
         await this._appendToBuffer(newInitSegment);
 
-        // 6. Hand the keys over to _onSeeking() to cleanly restart playback
+        // 6. Find the exact file offset for the target time
         let bestCue = this.cueMap[0];
         for (let i = 0; i < this.cueMap.length; i++) {
             if (this.cueMap[i].time <= targetTime) bestCue = this.cueMap[i];
             else break;
         }
 
-        // Force the video to jump to the keyframe. 
-        // This automatically triggers the browser's "seeking" event to start the loop!
+        const segmentPayloadStart = this.firstClusterOffset - Number(this.cueMap[0].offset);
+        this.currentOffset = segmentPayloadStart + Number(bestCue.offset);
+
+        // 7. Jump the video to the new time
         if (bestCue && this.video.currentTime !== bestCue.time) {
-            this.video.currentTime = bestCue.time; 
-        } else {
-            // If we are miraculously exactly on the cue frame, trigger it manually
-            this._onSeeking();
+            this.video.currentTime = bestCue.time;
         }
+
+        // 🛑 IOS FIX 1 (Cont.): Re-hook the seeking event AFTER the jump finishes
+        setTimeout(() => {
+            this.video.onseeking = () => this._onSeeking();
+        }, 100);
+
+        // 8. Start fetching the new language!
+        this.isFetching = false;
+        this.isSeeking = false;
+        this._streamLoop();
+        try { await this.video.play(); } catch (e) { }
     }
 
     // THE NEW, SAFE CODE
@@ -800,14 +817,14 @@ class CoreEngine {
                         this.sourceBuffer.removeEventListener('updateend', onUpdate);
                         this.sourceBuffer.removeEventListener('error', onError);
                     };
-                    
+
                     this.sourceBuffer.addEventListener('updateend', onUpdate);
                     this.sourceBuffer.addEventListener('error', onError);
 
                     // Start the asynchronous deletion
                     this.sourceBuffer.remove(0, currentTime - safeBackBuffer);
                 });
-                
+
                 this.log(`🗑️ Garbage Collector: Flushed buffer from 0 to ${currentTime - safeBackBuffer}`);
             } catch (e) {
                 this.log(`Garbage collection skipped: ${e.message}`);

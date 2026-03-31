@@ -73,10 +73,8 @@ pub extern "C" fn free_segment(ptr: *mut u8, size: usize) {
         return;
     }
     unsafe {
-        // Because we created this with `into_boxed_slice()`,
-        // we know for a fact that length == capacity.
-        // We safely rebuild the Vec and let it drop instantly out of scope.
-        let _ = Vec::from_raw_parts(ptr, size, size);
+        // Safely reconstruct the boxed slice and let it drop instantly
+        let _ = Box::from_raw(std::slice::from_raw_parts_mut(ptr, size));
     }
 }
 
@@ -389,7 +387,7 @@ impl Demuxer {
         self.needs_sync = true;
 
         self.mfra_ledger.clear();
-
+        
         self.absolute_file_offset = self.init_segment_len;
 
         self.seq_number = 1;
@@ -786,7 +784,7 @@ impl Demuxer {
 
         self.absolute_file_offset = mp4.len() as u64;
         self.init_segment_len = self.absolute_file_offset;
-
+        
         Ok(mp4)
     }
 
@@ -861,7 +859,7 @@ impl Demuxer {
 
                 match element {
                     Ok(MatroskaSpec::Timestamp(tc)) => self.current_cluster_time = tc,
-                    Ok(MatroskaSpec::SimpleBlock(block_data)) | Ok(MatroskaSpec::Block(block_data)) => {
+                    Ok(MatroskaSpec::SimpleBlock(block_data)) => {
                         let (track_id, header_len) = read_vint(&block_data);
                         if block_data.len() > header_len + 3 {
                             let offset = header_len + 3;
@@ -890,16 +888,8 @@ impl Demuxer {
                                         self.base_decode_time = pts;
                                     }
 
-                                    let dts = if self.base_decode_time == 0 && pts == 0 {
-                                        0
-                                    } else if pts > self.base_decode_time {
-                                        pts
-                                    } else {
-                                        self.base_decode_time + 90
-                                    };
-
-                                    self.base_decode_time = dts;
-
+                                    let dts = self.base_decode_time;
+                                    self.base_decode_time += self.frame_duration;
                                     let ctts = (pts as i64 - dts as i64) as i32;
 
                                     self.staged_video_frames.push(Frame {
@@ -923,29 +913,12 @@ impl Demuxer {
 
                                         let gap = (abs_pts_ms as i64) - (expected_ms as i64);
 
-                                        // THE NEW, SAFE CODE
-                                        if self.audio_base_decode_time == 0 {
-                                            // 1. Sync the clock to the MKV timestamp ONLY on the very first frame.
+                                        if self.audio_base_decode_time == 0
+                                            || gap > 500
+                                            || gap < -500
+                                        {
                                             self.audio_base_decode_time =
                                                 (abs_pts_ms * self.audio_sample_rate as u64) / 1000;
-                                        } else {
-                                            let expected_ms = if self.audio_sample_rate > 0 {
-                                                (self.audio_base_decode_time * 1000)
-                                                    / self.audio_sample_rate as u64
-                                            } else {
-                                                0
-                                            };
-
-                                            let gap = (abs_pts_ms as i64) - (expected_ms as i64);
-
-                                            // 2. Only snap the clock if there is an astronomically huge gap (> 5 seconds).
-                                            // This safely catches situations where a user seeks the video, but the
-                                            // JavaScript failed to call demuxer_reset() beforehand.
-                                            if gap > 5000 || gap < -5000 {
-                                                self.audio_base_decode_time = (abs_pts_ms
-                                                    * self.audio_sample_rate as u64)
-                                                    / 1000;
-                                            }
                                         }
 
                                         // Lock in the exact timestamp for this specific frame
@@ -997,32 +970,9 @@ impl Demuxer {
             self.buffer = tail;
         } else if force_process {
             if !is_final && self.buffer.len() > 1024 * 1024 {
-                let target_cutoff = self.buffer.len() - (1024 * 1024);
-                let mut sync_idx = None;
-
-                // Scan forward from our target cutoff to find the next valid MKV Cluster
-                for i in target_cutoff..self.buffer.len().saturating_sub(3) {
-                    if self.buffer[i] == 0x1F
-                        && self.buffer[i + 1] == 0x43
-                        && self.buffer[i + 2] == 0xB6
-                        && self.buffer[i + 3] == 0x75
-                    {
-                        sync_idx = Some(i);
-                        break;
-                    }
-                }
-
-                match sync_idx {
-                    Some(idx) => {
-                        // We found a clean cluster boundary. Safely drain everything before it.
-                        self.buffer.drain(0..idx);
-                    }
-                    None => {
-                        // If there is no sync marker in the last megabyte, keeping random bytes
-                        // will permanently break the parser. We must clear it entirely.
-                        self.buffer.clear();
-                    }
-                }
+                let cutoff = self.buffer.len() - (1024 * 1024);
+                let tail = self.buffer[cutoff..].to_vec();
+                self.buffer = tail;
             } else {
                 self.buffer.clear();
             }
@@ -1042,7 +992,7 @@ impl Demuxer {
             has_keyframe = true;
             keyframe_dts = self.staged_video_frames[0].dts;
         }
-
+        
         if has_keyframe {
             self.mfra_ledger.push(MfraEntry {
                 time: keyframe_dts,
@@ -1244,8 +1194,8 @@ pub extern "C" fn demuxer_get_mfra_box(ptr: *mut Demuxer) -> u32 {
     let demuxer = unsafe { &mut *ptr };
 
     let mut tfra: Vec<u8> = Vec::new();
-
-    tfra.extend_from_slice(&[0, 0, 0, 0, b't', b'f', b'r', b'a']);
+    
+    tfra.extend_from_slice(&[0, 0, 0, 0, b't', b'f', b'r', b'a']); 
     tfra.extend_from_slice(&[1, 0, 0, 0]); // Version 1
     tfra.extend_from_slice(&1u32.to_be_bytes()); // Track ID = 1
     tfra.extend_from_slice(&[0, 0, 0, 0]); // lengths
@@ -1279,7 +1229,7 @@ pub extern "C" fn demuxer_get_mfra_box(ptr: *mut Demuxer) -> u32 {
 
     // Pass to JS
     let mut boxed_slice = mfra.into_boxed_slice();
-    demuxer.last_segment_len = boxed_slice.len();
+    demuxer.last_segment_len = boxed_slice.len(); 
     let segment_ptr = boxed_slice.as_mut_ptr();
     std::mem::forget(boxed_slice);
 
@@ -1357,7 +1307,6 @@ fn read_signed_vint(data: &[u8]) -> (i64, usize) {
     ((v as i64) - zero_point, len)
 }
 
-// THE NEW, SAFE CODE for parse_lacing
 fn parse_lacing(block_data: &[u8], header_len: usize) -> Vec<Vec<u8>> {
     let flags = block_data[header_len + 2];
     let lacing = (flags & 0x06) >> 1;
@@ -1392,9 +1341,7 @@ fn parse_lacing(block_data: &[u8], header_len: usize) -> Vec<Vec<u8>> {
             sizes.push(s);
             total += s;
         }
-        // SAFE MATH: Prevent underflow if MKV metadata is corrupted
-        let used = pos.saturating_add(total);
-        sizes.push(payload.len().saturating_sub(used));
+        sizes.push(payload.len() - pos - total);
     } else if lacing == 3 {
         if pos >= payload.len() {
             return vec![payload.to_vec()];
@@ -1414,21 +1361,19 @@ fn parse_lacing(block_data: &[u8], header_len: usize) -> Vec<Vec<u8>> {
             let (diff, len) = read_signed_vint(&payload[pos..]);
             pos += len;
             last_size += diff;
-
-            // Safeguard against negative sizes from bad MKV data
-            let safe_size = if last_size < 0 { 0 } else { last_size as usize };
-            sizes.push(safe_size);
-            total = total.saturating_add(safe_size);
+            sizes.push(last_size as usize);
+            total += last_size as usize;
         }
-
-        // SAFE MATH: Prevent underflow if MKV metadata is corrupted
-        let used = pos.saturating_add(total);
-        sizes.push(payload.len().saturating_sub(used));
+        if payload.len() >= pos + total {
+            sizes.push(payload.len() - pos - total);
+        } else {
+            sizes.push(0);
+        }
     }
 
     let mut frames = Vec::new();
     for s in sizes {
-        if pos.saturating_add(s) <= payload.len() {
+        if pos + s <= payload.len() {
             frames.push(payload[pos..pos + s].to_vec());
             pos += s;
         }
