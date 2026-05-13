@@ -1,0 +1,14 @@
+prefix=../ffmpeg-wasm-lib
+exec_prefix=${prefix}
+libdir=../ffmpeg-wasm-lib/lib
+includedir=../ffmpeg-wasm-lib/include
+
+Name: libavdevice
+Description: FFmpeg device handling library
+Version: 61.1.100
+Requires: libavformat >= 61.1.102, libavcodec >= 61.3.100, libswresample >= 5.1.100, libavutil >= 59.8.100
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavdevice -lm
+Libs.private: 
+Cflags: -I${includedir}

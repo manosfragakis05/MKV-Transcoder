@@ -1,0 +1,14 @@
+prefix=../ffmpeg-wasm-lib
+exec_prefix=${prefix}
+libdir=../ffmpeg-wasm-lib/lib
+includedir=../ffmpeg-wasm-lib/include
+
+Name: libavfilter
+Description: FFmpeg audio/video filtering library
+Version: 10.1.100
+Requires: libavutil >= 59.8.100
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavfilter -pthread -lm
+Libs.private: 
+Cflags: -I${includedir}

@@ -1,0 +1,14 @@
+prefix=../ffmpeg-wasm-lib
+exec_prefix=${prefix}
+libdir=../ffmpeg-wasm-lib/lib
+includedir=../ffmpeg-wasm-lib/include
+
+Name: libavutil
+Description: FFmpeg utility library
+Version: 59.8.100
+Requires: 
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavutil -pthread -lm
+Libs.private: 
+Cflags: -I${includedir}

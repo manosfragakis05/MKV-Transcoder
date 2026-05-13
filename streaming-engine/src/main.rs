@@ -1448,6 +1448,8 @@ pub extern "C" fn demuxer_append_aac(
 
 fn main() {}
 
-//source ./emsdk_env.sh
+//source ~/emsdk/emsdk_env.sh
 //cd "C:\Users\manos\Documents\Projects\MKV Transcoder\streaming-engine"
 //cargo build --target wasm32-unknown-emscripten --release
+
+//cd "C:\Users\manos\Documents\Projects\MKV Transcoder\streaming-engine\c_src\ffmpeg_src"

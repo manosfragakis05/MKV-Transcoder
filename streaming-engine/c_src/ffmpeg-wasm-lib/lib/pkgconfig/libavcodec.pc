@@ -1,0 +1,14 @@
+prefix=../ffmpeg-wasm-lib
+exec_prefix=${prefix}
+libdir=../ffmpeg-wasm-lib/lib
+includedir=../ffmpeg-wasm-lib/include
+
+Name: libavcodec
+Description: FFmpeg codec library
+Version: 61.3.100
+Requires: libswresample >= 5.1.100, libavutil >= 59.8.100
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavcodec -pthread -lm
+Libs.private: 
+Cflags: -I${includedir}

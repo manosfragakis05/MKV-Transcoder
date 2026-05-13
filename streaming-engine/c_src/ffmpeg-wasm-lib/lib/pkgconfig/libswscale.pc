@@ -1,0 +1,14 @@
+prefix=../ffmpeg-wasm-lib
+exec_prefix=${prefix}
+libdir=../ffmpeg-wasm-lib/lib
+includedir=../ffmpeg-wasm-lib/include
+
+Name: libswscale
+Description: FFmpeg image rescaling library
+Version: 8.1.100
+Requires: libavutil >= 59.8.100
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lswscale -lm
+Libs.private: 
+Cflags: -I${includedir}
