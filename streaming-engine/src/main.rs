@@ -48,7 +48,7 @@ pub struct CuePoint {
 
 #[no_mangle]
 pub extern "C" fn alloc_memory(size: usize) -> *mut u8 {
-    let mut buf = Vec::with_capacity(size);
+    let mut buf = vec![0u8; size];
     let ptr = buf.as_mut_ptr();
     std::mem::forget(buf);
     ptr
@@ -318,6 +318,7 @@ pub struct Demuxer {
     audio_private: Vec<u8>,
     audio_sample_rate: u32,
     audio_channels: u16,
+    target_audio_channels: u16,
     initialized: bool,
     seq_number: u32,
     base_decode_time: u64,
@@ -358,6 +359,7 @@ impl Demuxer {
             audio_private: Vec::new(),
             audio_sample_rate: 48000,
             audio_channels: 2,
+            target_audio_channels: 0,
             initialized: false,
             seq_number: 1,
             base_decode_time: 0,
@@ -387,7 +389,7 @@ impl Demuxer {
         self.needs_sync = true;
 
         self.mfra_ledger.clear();
-        
+
         self.absolute_file_offset = self.init_segment_len;
 
         self.seq_number = 1;
@@ -445,7 +447,7 @@ impl Demuxer {
         }
 
         // Start the C decoder
-        if self.audio_track_id > 0 {
+        if self.audio_track_id > 0 && self.needs_transcode {
             let private_ptr = if self.audio_private.is_empty() {
                 std::ptr::null()
             } else {
@@ -453,29 +455,38 @@ impl Demuxer {
             };
             let private_len = self.audio_private.len() as i32;
 
-            // PASS THE REAL FFMPEG CODEC ID
-            let c_codec_id = if audio_codec == "A_AC3" {
-                86019
-            } else if audio_codec == "A_EAC3" {
-                86057
-            } else if audio_codec == "A_TRUEHD" {
-                86060
-            } else {
-                0
+            // FIX 1: Map the missing codecs so FFmpeg doesn't crash on DTS/FLAC
+            let c_codec_id = match audio_codec.as_str() {
+                "A_AC3" => 86019,
+                "A_EAC3" => 86057,
+                "A_TRUEHD" => 86060,
+                "A_DTS" => 86020,  // Added DTS
+                "A_FLAC" => 86028,
+                "A_OPUS" => 86076,
+                _ => 0,
             };
+
+            let mut target_channels = if self.target_audio_channels > 0 {
+                self.target_audio_channels
+            } else {
+                self.audio_channels
+            };
+
+            if target_channels > 6 { target_channels = 6; } 
+            else if target_channels == 7 { target_channels = 6; }
 
             unsafe {
                 init_audio(
                     c_codec_id,
                     self.audio_sample_rate as i32,
-                    self.audio_channels as i32,
+                    target_channels as i32,
                     private_ptr,
                     private_len,
                 );
             }
 
-            self.audio_channels = 2;
-            self.audio_sample_rate = 48000;
+            // FIX 2: Save the downmixed channels so the MP4 headers match!
+            self.audio_channels = target_channels;
         }
 
         if self.codec_private.is_empty() {
@@ -784,7 +795,7 @@ impl Demuxer {
 
         self.absolute_file_offset = mp4.len() as u64;
         self.init_segment_len = self.absolute_file_offset;
-        
+
         Ok(mp4)
     }
 
@@ -966,13 +977,12 @@ impl Demuxer {
         }
 
         if found_cluster && !force_process {
-            let tail = self.buffer[last_valid_idx..].to_vec();
-            self.buffer = tail;
+            self.buffer.drain(0..last_valid_idx); // keep unprocessed tail
         } else if force_process {
-            if !is_final && self.buffer.len() > 1024 * 1024 {
-                let cutoff = self.buffer.len() - (1024 * 1024);
-                let tail = self.buffer[cutoff..].to_vec();
-                self.buffer = tail;
+            if !is_final {
+                // Only keep a tiny overlap — nothing meaningful was left unread
+                let keep = self.buffer.len().min(16);
+                self.buffer.drain(0..self.buffer.len() - keep);
             } else {
                 self.buffer.clear();
             }
@@ -992,7 +1002,7 @@ impl Demuxer {
             has_keyframe = true;
             keyframe_dts = self.staged_video_frames[0].dts;
         }
-        
+
         if has_keyframe {
             self.mfra_ledger.push(MfraEntry {
                 time: keyframe_dts,
@@ -1113,6 +1123,14 @@ impl Demuxer {
 }
 
 // --- FFI DEMUXER EXPORTS ---
+#[no_mangle]
+pub extern "C" fn demuxer_set_target_channels(ptr: *mut Demuxer, channels: u16) {
+    if ptr.is_null() {
+        return;
+    }
+    let demuxer = unsafe { &mut *ptr };
+    demuxer.target_audio_channels = channels;
+}
 
 #[no_mangle]
 pub extern "C" fn demuxer_create(
@@ -1194,8 +1212,8 @@ pub extern "C" fn demuxer_get_mfra_box(ptr: *mut Demuxer) -> u32 {
     let demuxer = unsafe { &mut *ptr };
 
     let mut tfra: Vec<u8> = Vec::new();
-    
-    tfra.extend_from_slice(&[0, 0, 0, 0, b't', b'f', b'r', b'a']); 
+
+    tfra.extend_from_slice(&[0, 0, 0, 0, b't', b'f', b'r', b'a']);
     tfra.extend_from_slice(&[1, 0, 0, 0]); // Version 1
     tfra.extend_from_slice(&1u32.to_be_bytes()); // Track ID = 1
     tfra.extend_from_slice(&[0, 0, 0, 0]); // lengths
@@ -1229,7 +1247,7 @@ pub extern "C" fn demuxer_get_mfra_box(ptr: *mut Demuxer) -> u32 {
 
     // Pass to JS
     let mut boxed_slice = mfra.into_boxed_slice();
-    demuxer.last_segment_len = boxed_slice.len(); 
+    demuxer.last_segment_len = boxed_slice.len();
     let segment_ptr = boxed_slice.as_mut_ptr();
     std::mem::forget(boxed_slice);
 
@@ -1261,18 +1279,31 @@ fn read_vint(data: &[u8]) -> (u64, usize) {
         return (0, 0);
     }
     let v = data[0];
+
     let len = if v & 0x80 != 0 {
         1
     } else if v & 0x40 != 0 {
         2
     } else if v & 0x20 != 0 {
         3
-    } else {
+    } else if v & 0x10 != 0 {
         4
+    } else if v & 0x08 != 0 {
+        5
+    } else if v & 0x04 != 0 {
+        6
+    } else if v & 0x02 != 0 {
+        7
+    } else if v & 0x01 != 0 {
+        8
+    } else {
+        return (0, 0);
     };
-    if len > 4 || data.len() < len {
+
+    if len > 8 || data.len() < len {
         return (0, 0);
     }
+
     let mut value = (v & (0xFF >> len)) as u64;
     for i in 1..len {
         value = (value << 8) | (data[i] as u64);

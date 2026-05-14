@@ -16,9 +16,11 @@ static AVPacket *pkt = NULL;
 static SwrContext *swr = NULL;
 
 static float *audio_buffer = NULL;
-#define MAX_SAMPLES 192000 
+#define MAX_SAMPLES 192000
+#define MAX_CHANNELS 6
 
 static int target_sample_rate = 48000;
+static int target_channels = 2;
 
 // 1. INITIALIZATION
 EMSCRIPTEN_KEEPALIVE
@@ -36,8 +38,10 @@ int init_audio(int codec_id, int sample_rate, int channels, uint8_t *extradata, 
     
     // Apply dynamic sample rate and channels
     target_sample_rate = sample_rate > 0 ? sample_rate : 48000;
+    target_channels = channels > 0 ? channels : 2;
+    
     dec_ctx->sample_rate = target_sample_rate;
-    av_channel_layout_default(&dec_ctx->ch_layout, channels > 0 ? channels : 2);
+    av_channel_layout_default(&dec_ctx->ch_layout, target_channels);
 
     // Apply ExtraData (Required for many modern audio formats)
     if (extradata_size > 0 && extradata != NULL) {
@@ -52,7 +56,7 @@ int init_audio(int codec_id, int sample_rate, int channels, uint8_t *extradata, 
     frame = av_frame_alloc();
     pkt = av_packet_alloc();
     
-    audio_buffer = (float *)malloc(MAX_SAMPLES * 2 * sizeof(float));
+    audio_buffer = (float *)malloc(MAX_SAMPLES * MAX_CHANNELS * sizeof(float));
 
     return 0;
 }
@@ -75,7 +79,7 @@ int decode_audio(uint8_t *data_ptr, int data_size) {
     // 3. RESAMPLING
     if (!swr) {
         AVChannelLayout out_layout;
-        av_channel_layout_default(&out_layout, 2);
+        av_channel_layout_default(&out_layout, target_channels);
 
         swr_alloc_set_opts2(&swr, 
                             &out_layout, 
@@ -88,10 +92,10 @@ int decode_audio(uint8_t *data_ptr, int data_size) {
         swr_init(swr);
     }
 
-    // Fixed array initialization for emscripten
-    uint8_t *out_ptrs[2];
-    out_ptrs[0] = (uint8_t *)audio_buffer;
-    out_ptrs[1] = (uint8_t *)(audio_buffer + MAX_SAMPLES);
+    uint8_t *out_ptrs[MAX_CHANNELS];
+    for (int i = 0; i < target_channels; i++) {
+        out_ptrs[i] = (uint8_t *)(audio_buffer + (i * MAX_SAMPLES));
+    }
 
     return swr_convert(swr, out_ptrs, MAX_SAMPLES, (const uint8_t **)frame->data, frame->nb_samples);
 }
