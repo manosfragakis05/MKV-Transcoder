@@ -9,6 +9,8 @@
 extern const AVCodec ff_ac3_decoder;
 extern const AVCodec ff_eac3_decoder;
 extern const AVCodec ff_truehd_decoder;
+extern const AVCodec ff_flac_decoder;
+extern const AVCodec ff_opus_decoder;
 
 static AVCodecContext *dec_ctx = NULL;
 static AVFrame *frame = NULL;
@@ -30,6 +32,8 @@ int init_audio(int codec_id, int sample_rate, int channels, uint8_t *extradata, 
     if (codec_id == 86019) codec = &ff_ac3_decoder;
     else if (codec_id == 86057) codec = &ff_eac3_decoder;
     else if (codec_id == 86060) codec = &ff_truehd_decoder;
+    else if (codec_id == 86028) codec = &ff_flac_decoder; // FLAC
+    else if (codec_id == 86076) codec = &ff_opus_decoder;
     else codec = avcodec_find_decoder(codec_id);
 
     if (!codec) return -1;

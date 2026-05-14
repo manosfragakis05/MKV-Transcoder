@@ -246,7 +246,8 @@ class CoreEngine {
             codec: 'mp4a.40.2',
             sampleRate: currentSampleRate,
             numberOfChannels: requestedChannels,
-            bitrate: requestedChannels > 2 ? 192000 : 128000
+            bitrate: requestedChannels * 64000,
+            bitrateMode: "variable"
         };
 
         const support = await AudioEncoder.isConfigSupported(idealConfig);
